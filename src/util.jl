@@ -74,6 +74,13 @@ function base64url(bytes::AbstractVector{UInt8})
     return String(strip_trailing_equals(stripped))
 end
 
+function base64urldecode(str::AbstractString)
+    normalized = replace(replace(String(str), '-' => '+'), '_' => '/')
+    padding = (4 - length(normalized) % 4) % 4
+    padded = normalized * repeat("=", padding)
+    return Base64.base64decode(padded)
+end
+
 function strip_trailing_equals(str::AbstractString)
     idx = lastindex(str)
     while idx >= firstindex(str) && str[idx] == '='

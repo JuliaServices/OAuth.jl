@@ -159,7 +159,7 @@ end
             headers isa HTTP.Headers || error("Expected HTTP.Headers")
             captured[] = (headers, body)
             response_headers = HTTP.Headers(["DPoP-Nonce" => "nonce123"])
-            return HTTP.Response(200, JSON.json(token_doc), response_headers)
+            return HTTP.Response(200, response_headers, JSON.json(token_doc))
         end,
     )
     rsa_pem = fixture_string("rsa_private.pem")
@@ -615,4 +615,111 @@ end
     result2 = fetch(task2)
     @test result2.token.access_token == "tokenXYZ"
     @test result2.callback.code == "uvw000"
+end
+
+@testset "Server helpers" begin
+    prm_config = ProtectedResourceConfig(
+        resource = "https://api.example.com",
+        authorization_servers = ["https://id.example.com"],
+        scopes_supported = ["openid", "profile"],
+    )
+    prm_router = HTTP.Router()
+    prm_handler = register_protected_resource_metadata!(prm_router, prm_config)
+    prm_response = prm_handler(HTTP.Request("GET", prm_config.path))
+    prm_doc = JSON.parse(String(prm_response.body))
+    @test prm_doc["authorization_servers"] == ["https://id.example.com"]
+
+    as_config = AuthorizationServerConfig(
+        issuer = "https://id.example.com",
+        authorization_endpoint = "https://id.example.com/auth",
+        token_endpoint = "https://id.example.com/token",
+        jwks_uri = "https://id.example.com/jwks.json",
+        grant_types_supported = ["authorization_code", "client_credentials"],
+        scopes_supported = ["openid"],
+    )
+    as_router = HTTP.Router()
+    as_handler = register_authorization_server_metadata!(as_router, as_config)
+    as_response = as_handler(HTTP.Request("GET", as_config.path))
+    as_doc = JSON.parse(String(as_response.body))
+    @test as_doc["issuer"] == "https://id.example.com"
+    @test as_doc["grant_types_supported"] == ["authorization_code", "client_credentials"]
+
+    rsa_pem = fixture_string("rsa_private.pem")
+    store = InMemoryTokenStore()
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://id.example.com",
+        audience = ["https://api.example.com"],
+        private_key = rsa_pem,
+        kid = "kid-1",
+    )
+    issued = issue_access_token(
+        issuer;
+        subject = "user-123",
+        client_id = "client-xyz",
+        scope = ["read", "write"],
+        store = store,
+    )
+    @test !isempty(issued.token)
+    jwk = public_jwk(issuer)
+    @test jwk["kid"] == "kid-1"
+    jwks = Dict("keys" => [jwk])
+    validator = TokenValidationConfig(
+        issuer = "https://id.example.com",
+        audience = ["https://api.example.com"],
+        jwks = jwks,
+    )
+    claims = validate_jwt_access_token(issued.token, validator; required_scopes = ["read"])
+    @test claims.subject == "user-123"
+    @test "write" in claims.scope
+
+    middleware = protected_resource_middleware(
+        req -> begin
+            req.context[:handled] = true
+            HTTP.Response(200, "ok")
+        end,
+        validator;
+        resource_metadata_url = "https://api.example.com/.well-known/oauth-protected-resource",
+        required_scopes = ["read"],
+    )
+    req_missing = HTTP.Request("GET", "/resource")
+    resp_missing = middleware(req_missing)
+    @test resp_missing.status == 401
+    @test occursin("resource_metadata", HTTP.header(resp_missing.headers, "WWW-Authenticate"))
+
+    req_ok = HTTP.Request("GET", "/resource", ["Authorization" => "Bearer $(issued.token)"], "")
+    resp_ok = middleware(req_ok)
+    @test resp_ok.status == 200
+    @test req_ok.context[:oauth_token].client_id == "client-xyz"
+
+    jwks_router = HTTP.Router()
+    jwks_handler = register_jwks_endpoint!(jwks_router, [jwk])
+    jwks_response = jwks_handler(HTTP.Request("GET", DEFAULT_JWKS_PATH))
+    jwks_doc = JSON.parse(String(jwks_response.body))
+    @test length(jwks_doc["keys"]) == 1
+
+    introspect = build_introspection_handler(store)
+    body = "token=$(issued.token)"
+    req_introspect = HTTP.Request("POST", "/introspect", ["Content-Type" => "application/x-www-form-urlencoded"], body)
+    resp_introspect = introspect(req_introspect)
+    active_doc = JSON.parse(String(resp_introspect.body))
+    @test active_doc["active"] == true
+    @test active_doc["client_id"] == "client-xyz"
+
+    revoke = build_revocation_handler(store)
+    req_revoke = HTTP.Request("POST", "/revoke", ["Content-Type" => "application/x-www-form-urlencoded"], body)
+    resp_revoke = revoke(req_revoke)
+    @test resp_revoke.status == 200
+
+    resp_inactive = introspect(req_introspect)
+    inactive_doc = JSON.parse(String(resp_inactive.body))
+    @test inactive_doc["active"] == false
+
+    basic_auth = BasicCredentialsAuthenticator(credentials = Dict("client" => "secret"))
+    introspect_auth = build_introspection_handler(store; authenticator = basic_auth)
+    resp_unauth = introspect_auth(req_introspect)
+    @test resp_unauth.status == 401
+    basic_header = "Basic " * Base64.base64encode("client:secret")
+    req_authd = HTTP.Request("POST", "/introspect", ["Authorization" => basic_header], body)
+    resp_authd = introspect_auth(req_authd)
+    @test resp_authd.status == 200
 end

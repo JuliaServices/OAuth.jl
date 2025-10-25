@@ -322,8 +322,17 @@ normalize_dpop_url(url::AbstractString) = begin
         path = "/"
     end
     base = string(scheme, "://", host)
-    if uri.port !== nothing && !is_default_port(scheme, uri.port)
-        base = string(base, ":", uri.port)
+    port_value = uri.port
+    if port_value isa AbstractString
+        if isempty(port_value)
+            port_value = nothing
+        else
+            parsed = tryparse(Int, port_value)
+            port_value = parsed === nothing ? port_value : parsed
+        end
+    end
+    if port_value !== nothing && !is_default_port(scheme, port_value)
+        base = string(base, ":", port_value)
     end
     if isempty(query)
         return base * path

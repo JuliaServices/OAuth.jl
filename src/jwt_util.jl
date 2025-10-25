@@ -43,6 +43,17 @@ struct ECSigner <: JWTSigner
     curve::Symbol        # :P256 or :P384
 end
 
+abstract type JWTVerifier end
+
+struct RSAVerifier <: JWTVerifier
+    key::RSAKeyHandle
+end
+
+struct ECVerifier <: JWTVerifier
+    key::ECCKeyHandle
+    curve::Symbol
+end
+
 const SUPPORTED_RSA_ALGS = Set([:RS256])
 const SUPPORTED_EC_ALGS = Set([:ES256, :ES384])
 
@@ -156,6 +167,41 @@ function sign_jws(signer::ECSigner, alg::Symbol, signing_input::Vector{UInt8})
     return der_to_jws_signature(der_signature, size)
 end
 
+function verify_jws(verifier::RSAVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
+    alg in SUPPORTED_RSA_ALGS || error("Unsupported RSA JWT alg $(alg)")
+    digest = SHA.sha256(signing_input)
+    GC.@preserve digest signature begin
+        digest_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
+        sig_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(signature)), length(signature))
+        result = aws_rsa_key_pair_verify_signature(
+            verifier.key.ptr,
+            AWS_CAL_RSA_SIGNATURE_PKCS1_5_SHA256,
+            digest_cursor,
+            sig_cursor,
+        )
+        return result == 0
+    end
+end
+
+function verify_jws(verifier::ECVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
+    alg in SUPPORTED_EC_ALGS || error("Unsupported EC JWT alg $(alg)")
+    digest = algorithm_digest(alg, signing_input)
+    coord = verifier.curve == :P256 ? 32 : 48
+    der_signature = jws_to_der_signature(signature, coord)
+    GC.@preserve digest der_signature begin
+        digest_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
+        der_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(der_signature)), length(der_signature))
+        cursor_ref = Ref(digest_cursor)
+        sig_ref = Ref(der_cursor)
+        result = aws_ecc_key_pair_verify_signature(
+            verifier.key.ptr,
+            cursor_ref,
+            sig_ref,
+        )
+        return result == 0
+    end
+end
+
 function algorithm_digest(alg::Symbol, input::Vector{UInt8})
     if alg in (:ES256, :RS256)
         return SHA.sha256(input)
@@ -220,6 +266,65 @@ function lpad_bytes(bytes::Vector{UInt8}, size::Int)
     return padded
 end
 
+function strip_leading_zeros(bytes::Vector{UInt8})
+    idx = findfirst(b -> b != 0x00, bytes)
+    if idx === nothing
+        return UInt8[0x00]
+    elseif idx == 1
+        return copy(bytes)
+    else
+        return bytes[idx:end]
+    end
+end
+
+function encode_der_length(len::Integer)
+    len < 0 && error("DER length cannot be negative")
+    if len < 0x80
+        return UInt8[len]
+    end
+    buf = UInt8[]
+    value = len
+    while value > 0
+        pushfirst!(buf, value & 0xff)
+        value >>= 8
+    end
+    pushfirst!(buf, 0x80 | length(buf))
+    return buf
+end
+
+function encode_der_integer(bytes::Vector{UInt8})
+    stripped = strip_leading_zeros(bytes)
+    if stripped[1] & 0x80 != 0
+        stripped = vcat(UInt8[0x00], stripped)
+    end
+    len_bytes = encode_der_length(length(stripped))
+    return vcat(UInt8[0x02], len_bytes, stripped)
+end
+
+function encode_der_sequence(parts::Vector{Vector{UInt8}})
+    total_len = sum(length, parts)
+    len_bytes = encode_der_length(total_len)
+    buffer = Vector{UInt8}(undef, 1 + length(len_bytes) + total_len)
+    buffer[1] = 0x30
+    copyto!(buffer, 2, len_bytes, 1, length(len_bytes))
+    offset = 1 + length(len_bytes)
+    for part in parts
+        copyto!(buffer, offset + 1, part, 1, length(part))
+        offset += length(part)
+    end
+    return buffer
+end
+
+function jws_to_der_signature(signature::Vector{UInt8}, coordinate_size::Int)
+    expected = coordinate_size * 2
+    length(signature) == expected || error("Invalid JWS signature length for curve size $(coordinate_size)")
+    r = signature[1:coordinate_size]
+    s = signature[coordinate_size+1:end]
+    r_der = encode_der_integer(r)
+    s_der = encode_der_integer(s)
+    return encode_der_sequence([r_der, s_der])
+end
+
 function base64urlencode(data)
     if data isa AbstractVector{UInt8}
         return base64url(data)
@@ -256,4 +361,94 @@ function build_jws_compact(header::Dict{String,Any}, payload::Dict{String,Any}, 
     signature = sign_jws(signer, alg, signing_input)
     encoded_signature = base64urlencode(signature)
     return string(encoded_header, ".", encoded_payload, ".", encoded_signature)
+end
+
+function decode_compact_jwt(token::AbstractString)
+    parts = split(String(token), '.')
+    length(parts) == 3 || throw(OAuthError(:invalid_token, "JWT must contain three segments"))
+    header = JSON.parse(String(base64urldecode(parts[1])))
+    payload = JSON.parse(String(base64urldecode(parts[2])))
+    signature = base64urldecode(parts[3])
+    signing_input = Vector{UInt8}(codeunits(string(parts[1], ".", parts[2])))
+    return header, payload, signature, signing_input
+end
+
+function rsa_verifier_from_der(der::Vector{UInt8})
+    alloc = default_aws_allocator()
+    key_ptr = Ptr{aws_rsa_key_pair}(C_NULL)
+    GC.@preserve der begin
+        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(der)), length(der))
+        key_ptr = aws_rsa_key_pair_new_from_public_key_pkcs1(alloc, cursor)
+    end
+    key_ptr == C_NULL && error("Failed to load RSA public key from DER bytes")
+    return RSAVerifier(RSAKeyHandle(key_ptr))
+end
+
+function rsa_verifier_from_components(modulus::Vector{UInt8}, exponent::Vector{UInt8})
+    der = encode_der_sequence([encode_der_integer(modulus), encode_der_integer(exponent)])
+    return rsa_verifier_from_der(der)
+end
+
+function ecc_public_coordinates(signer::ECSigner)
+    x_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
+    y_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
+    aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
+    x_bytes = unsafe_wrap(Vector{UInt8}, x_ref[].ptr, x_ref[].len; own=false)
+    y_bytes = unsafe_wrap(Vector{UInt8}, y_ref[].ptr, y_ref[].len; own=false)
+    return copy(x_bytes), copy(y_bytes)
+end
+
+function ecc_verifier_from_coordinates(x::Vector{UInt8}, y::Vector{UInt8}, curve::Symbol)
+    alloc = default_aws_allocator()
+    curve_id = curve == :P256 ? AWS_CAL_ECDSA_P256 :
+               curve == :P384 ? AWS_CAL_ECDSA_P384 :
+               error("Unsupported EC curve $(curve)")
+    key_ptr = Ptr{aws_ecc_key_pair}(C_NULL)
+    GC.@preserve x y begin
+        x_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(x)), length(x))
+        y_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(y)), length(y))
+        key_ptr = aws_ecc_key_pair_new_from_public_key(alloc, curve_id, Ref(x_cursor), Ref(y_cursor))
+    end
+    key_ptr == C_NULL && error("Failed to load EC public key")
+    return ECVerifier(ECCKeyHandle(key_ptr), curve)
+end
+
+function parse_rsa_pkcs1_private_key(bytes::Vector{UInt8})
+    idx = 1
+    bytes[idx] == 0x30 || error("Invalid RSA private key (expected sequence)")
+    idx += 1
+    _, consumed = read_der_length(bytes, idx)
+    idx += consumed
+    _, idx = parse_der_integer(bytes, idx) # version
+    modulus, idx = parse_der_integer(bytes, idx)
+    exponent, _ = parse_der_integer(bytes, idx)
+    return modulus, exponent
+end
+
+function unwrap_pkcs8_private_key(bytes::Vector{UInt8})
+    idx = 1
+    bytes[idx] == 0x30 || error("Invalid PKCS#8 key (expected sequence)")
+    idx += 1
+    _, consumed = read_der_length(bytes, idx)
+    idx += consumed
+    _, idx = parse_der_integer(bytes, idx) # version
+    bytes[idx] == 0x30 || error("Invalid PKCS#8 algorithm identifier")
+    idx += 1
+    alg_len, alg_consumed = read_der_length(bytes, idx)
+    idx += alg_consumed + alg_len
+    bytes[idx] == 0x04 || error("PKCS#8 private key must be an octet string")
+    idx += 1
+    key_len, consumed = read_der_length(bytes, idx)
+    idx += consumed
+    return copy(bytes[idx:idx + key_len - 1])
+end
+
+function rsa_public_components_from_private_bytes(raw)
+    bytes = normalize_key_bytes(raw)
+    try
+        return parse_rsa_pkcs1_private_key(bytes)
+    catch
+        pkcs1 = unwrap_pkcs8_private_key(bytes)
+        return parse_rsa_pkcs1_private_key(pkcs1)
+    end
 end
