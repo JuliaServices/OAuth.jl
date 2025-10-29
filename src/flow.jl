@@ -57,13 +57,14 @@ function start_pkce_authorization(
     browser_command::Union{Cmd,Nothing}=nothing,
     issuer::Union{String,Nothing}=nothing,
     extra_authorize_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
     redirect_uri=nothing,
     start_listener::Bool=true,
     listener_host::AbstractString=DEFAULT_LOOPBACK_HOST,
     listener_port::Integer=DEFAULT_LOOPBACK_PORT,
     listener_path::AbstractString=DEFAULT_LOOPBACK_PATH,
 )
+    verbose = effective_verbose(config, verbose)
     resource_meta = fetch_protected_resource_metadata(prm_url; http=http, verbose=verbose)
     issuer_url = select_authorization_server(resource_meta; issuer=issuer)
     auth_meta = fetch_authorization_server_metadata(issuer_url; http=http, verbose=verbose)
@@ -96,13 +97,14 @@ function start_pkce_authorization_from_issuer(
     wait::Bool=false,
     browser_command::Union{Cmd,Nothing}=nothing,
     extra_authorize_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
     redirect_uri=nothing,
     start_listener::Bool=true,
     listener_host::AbstractString=DEFAULT_LOOPBACK_HOST,
     listener_port::Integer=DEFAULT_LOOPBACK_PORT,
     listener_path::AbstractString=DEFAULT_LOOPBACK_PATH,
 )
+    verbose = effective_verbose(config, verbose)
     auth_meta = fetch_authorization_server_metadata(issuer_url; http=http, verbose=verbose)
     return prepare_pkce_session(
         auth_meta,
@@ -133,13 +135,14 @@ function prepare_pkce_session(
     wait::Bool,
     browser_command::Union{Cmd,Nothing},
     extra_authorize_params::Dict{String,String},
-    verbose::Bool,
+    verbose::Union{Bool,Nothing}=nothing,
     redirect_uri,
     start_listener::Bool,
     listener_host::AbstractString,
     listener_port::Integer,
     listener_path::AbstractString,
 )
+    verbose = effective_verbose(config, verbose)
     auth_meta.authorization_endpoint === nothing && throw(OAuthError(:metadata_error, "Authorization endpoint missing in issuer metadata"))
     if !isempty(auth_meta.code_challenge_methods_supported)
         methods = String.(auth_meta.code_challenge_methods_supported)
@@ -189,6 +192,7 @@ function prepare_pkce_session(
         scopes = config.scopes,
         additional_parameters = config.additional_parameters,
         dpop = config.dpop,
+        verbose = verbose,
     )
     try
         request = AuthorizationRequest(
@@ -222,7 +226,8 @@ function prepare_pkce_session(
     end
 end
 
-function exchange_code_for_token(metadata::AuthorizationServerMetadata, config::PublicClientConfig, code::AbstractString, verifier::PKCEVerifier; http=HTTP, extra_params=Dict{String,String}(), verbose::Bool=false)
+function exchange_code_for_token(metadata::AuthorizationServerMetadata, config::PublicClientConfig, code::AbstractString, verifier::PKCEVerifier; http=HTTP, extra_params=Dict{String,String}(), verbose::Union{Bool,Nothing}=nothing)
+    verbose = effective_verbose(config, verbose)
     metadata.token_endpoint === nothing && throw(OAuthError(:metadata_error, "Token endpoint missing in issuer metadata"))
     ensure_https_url(String(metadata.token_endpoint), "token_endpoint")
     config.redirect_uri === nothing && throw(OAuthError(:configuration_error, "redirect_uri required for token exchange"))
@@ -292,7 +297,7 @@ function complete_pkce_authorization(
     issuer::Union{String,Nothing}=nothing,
     extra_authorize_params=Dict{String,String}(),
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
     redirect_uri=nothing,
     start_listener::Bool=true,
     listener_host::AbstractString=DEFAULT_LOOPBACK_HOST,
@@ -300,6 +305,7 @@ function complete_pkce_authorization(
     listener_path::AbstractString=DEFAULT_LOOPBACK_PATH,
     timeout::Real=180,
 )
+    verbose = effective_verbose(config, verbose)
     session = start_pkce_authorization(
         prm_url,
         config;
@@ -338,7 +344,7 @@ function complete_pkce_authorization_from_issuer(
     browser_command::Union{Cmd,Nothing}=nothing,
     extra_authorize_params=Dict{String,String}(),
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
     redirect_uri=nothing,
     start_listener::Bool=true,
     listener_host::AbstractString=DEFAULT_LOOPBACK_HOST,
@@ -346,6 +352,7 @@ function complete_pkce_authorization_from_issuer(
     listener_path::AbstractString=DEFAULT_LOOPBACK_PATH,
     timeout::Real=180,
 )
+    verbose = effective_verbose(config, verbose)
     session = start_pkce_authorization_from_issuer(
         issuer_url,
         config;
@@ -376,9 +383,10 @@ function finalize_pkce_session(
     session::AuthorizationSession;
     http=HTTP,
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
     timeout::Real=180,
 )
+    verbose = effective_verbose(session, verbose)
     extra_params = Dict{String,String}()
     for (k, v) in extra_token_params
         extra_params[String(k)] = String(v)
@@ -408,8 +416,9 @@ function request_client_credentials_token(
     config::ConfidentialClientConfig;
     http=HTTP,
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
 )
+    verbose = effective_verbose(config, verbose)
     metadata.token_endpoint === nothing && throw(OAuthError(:metadata_error, "Token endpoint missing in issuer metadata"))
     ensure_https_url(String(metadata.token_endpoint), "token_endpoint")
     if !isempty(metadata.grant_types_supported)
@@ -476,8 +485,9 @@ function request_client_credentials_token_from_issuer(
     config::ConfidentialClientConfig;
     http=HTTP,
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
 )
+    verbose = effective_verbose(config, verbose)
     auth_meta = fetch_authorization_server_metadata(issuer_url; http=http, verbose=verbose)
     token = request_client_credentials_token(
         auth_meta,
@@ -495,8 +505,9 @@ function request_client_credentials_token(
     http=HTTP,
     issuer=nothing,
     extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
+    verbose::Union{Bool,Nothing}=nothing,
 )
+    verbose = effective_verbose(config, verbose)
     resource_meta = fetch_protected_resource_metadata(prm_url; http=http, verbose=verbose)
     issuer_url = select_authorization_server(resource_meta; issuer=issuer)
     result = request_client_credentials_token_from_issuer(

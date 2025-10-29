@@ -101,6 +101,7 @@ struct ConfidentialClientConfig{T<:TokenEndpointAuth}
     scopes::Vector{String}
     additional_parameters::StringParams
     dpop::Union{DPoPAuth,Nothing}
+    verbose::Bool
 end
 
 struct PublicClientConfig
@@ -109,6 +110,7 @@ struct PublicClientConfig
     scopes::Vector{String}
     additional_parameters::StringParams
     dpop::Union{DPoPAuth,Nothing}
+    verbose::Bool
 end
 
 function ClientSecretAuth(secret::AbstractString; method::Union{Symbol,AbstractString}=:client_secret_basic)
@@ -155,7 +157,7 @@ function DPoPAuth(; private_key, public_jwk, alg::Union{Symbol,AbstractString}=:
     return DPoPAuth(signer, alg_symbol, jwk, maybe_string(kid), thumbprint, Int(iat_skew))
 end
 
-function ConfidentialClientConfig(; client_id, client_secret=nothing, credential::Union{TokenEndpointAuth,Nothing}=nothing, scopes=String[], additional_parameters=nothing, token_endpoint_auth_method=:client_secret_basic, dpop::Union{DPoPAuth,Nothing}=nothing)
+function ConfidentialClientConfig(; client_id, client_secret=nothing, credential::Union{TokenEndpointAuth,Nothing}=nothing, scopes=String[], additional_parameters=nothing, token_endpoint_auth_method=:client_secret_basic, dpop::Union{DPoPAuth,Nothing}=nothing, verbose::Bool=false)
     scope_list = String[String(s) for s in scopes]
     params = StringParams()
     if additional_parameters !== nothing
@@ -176,10 +178,11 @@ function ConfidentialClientConfig(; client_id, client_secret=nothing, credential
         scope_list,
         params,
         dpop,
+        verbose,
     )
 end
 
-function PublicClientConfig(; client_id, redirect_uri=nothing, scopes=String[], additional_parameters=nothing, dpop::Union{DPoPAuth,Nothing}=nothing)
+function PublicClientConfig(; client_id, redirect_uri=nothing, scopes=String[], additional_parameters=nothing, dpop::Union{DPoPAuth,Nothing}=nothing, verbose::Bool=false)
     scope_list = String[String(s) for s in scopes]
     params = StringParams()
     if additional_parameters !== nothing
@@ -188,8 +191,15 @@ function PublicClientConfig(; client_id, redirect_uri=nothing, scopes=String[], 
         end
     end
     redirect_value = redirect_uri === nothing ? nothing : String(redirect_uri)
-    return PublicClientConfig(String(client_id), redirect_value, scope_list, params, dpop)
+    return PublicClientConfig(String(client_id), redirect_value, scope_list, params, dpop, verbose)
 end
+
+config_verbose(::Any) = false
+
+config_verbose(config::ConfidentialClientConfig) = config.verbose
+config_verbose(config::PublicClientConfig) = config.verbose
+
+effective_verbose(source, verbose::Union{Bool,Nothing}) = verbose === nothing ? config_verbose(source) : verbose
 
 Base.@kwdef struct AuthorizationRequest
     authorization_endpoint::String
@@ -386,3 +396,5 @@ Base.@kwdef struct AuthorizationSession
     client_config::PublicClientConfig
     listener::Union{LoopbackListener,Nothing}
 end
+
+config_verbose(session::AuthorizationSession) = config_verbose(session.client_config)
