@@ -418,8 +418,8 @@ function TokenValidationConfig(; issuer, audience, jwks, allowed_algs=(:RS256, :
 end
 
 function build_verification_keys(jwks)
-    key_entries = jwks isa Dict ? (haskey(jwks, "keys") ? jwks["keys"] : jwks) : jwks
-    key_entries isa AbstractVector || throw(ArgumentError("jwks must be a Dict or Vector"))
+    key_entries = jwks isa AbstractDict ? (haskey(jwks, "keys") ? jwks["keys"] : jwks) : jwks
+    key_entries isa AbstractVector || throw(ArgumentError("jwks must be a AbstractDict or AbstractVector"))
     keys = VerificationKey[]
     for item in key_entries
         kty = uppercase(String(item["kty"]))
@@ -520,6 +520,7 @@ function validate_jwt_access_token(token::AbstractString, config::TokenValidatio
         any(in(config.audience), aud_claim) || throw(OAuthError(:invalid_token, "Audience mismatch"))
     end
     scope_claims = parse_scope_claim(payload)
+    @info payload scope_claims required_scopes
     if !isempty(required_scopes)
         missing = [scope for scope in required_scopes if !(scope in scope_claims)]
         !isempty(missing) && throw(OAuthError(:insufficient_scope, "Missing required scopes: $(join(missing, ", "))"))
@@ -561,13 +562,15 @@ function unauthorized_response(resource_metadata_url; realm=nothing, required_sc
     return HTTP.Response(status, HTTP.Headers(["WWW-Authenticate" => header]), "")
 end
 
-function protected_resource_middleware(handler::Function, validator::TokenValidationConfig; resource_metadata_url::AbstractString, realm=nothing, required_scopes=String[], context_key::Symbol=:oauth_token)
+function protected_resource_middleware(handler::Function, validator::TokenValidationConfig; resource_metadata_url::AbstractString, realm=nothing, required_scopes=String[], context_key::Symbol=:oauth_token, verbose::Bool=false)
     scopes = [String(s) for s in required_scopes]
     function middleware(req::HTTP.Request)
         token = bearer_token(req)
         if isempty(token)
             return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes)
         end
+        # verbose && println("token:")
+        # verbose && println(token)
         claims = try
             validate_jwt_access_token(token, validator; required_scopes=scopes)
         catch err
