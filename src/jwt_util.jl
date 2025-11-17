@@ -1,6 +1,13 @@
 # Internal utilities for JOSE/JWT handling with LibAwsCal backing.
 
+using libsodium_jll
+
 const AwsCommon = LibAwsCal.LibAwsCommon
+const LIBSODIUM = libsodium_jll.libsodium
+const ED25519_PUBLIC_KEY_BYTES = 32
+const ED25519_SECRET_KEY_BYTES = 64
+const ED25519_SIGNATURE_BYTES = 64
+const ED25519_SEED_BYTES = 32
 
 abstract type JWTSigner end
 
@@ -43,6 +50,11 @@ struct ECSigner <: JWTSigner
     curve::Symbol        # :P256 or :P384
 end
 
+struct EdDSASigner <: JWTSigner
+    secret::Vector{UInt8}
+    public::Vector{UInt8}
+end
+
 abstract type JWTVerifier end
 
 struct RSAVerifier <: JWTVerifier
@@ -54,8 +66,31 @@ struct ECVerifier <: JWTVerifier
     curve::Symbol
 end
 
-const SUPPORTED_RSA_ALGS = Set([:RS256])
+struct EdDSAVerifier <: JWTVerifier
+    public::Vector{UInt8}
+end
+
+const SUPPORTED_RSA_ALGS = Set([:RS256, :PS256])
 const SUPPORTED_EC_ALGS = Set([:ES256, :ES384])
+const SUPPORTED_OKP_ALGS = Set([:EDDSA])
+
+function rsa_signature_algorithm(alg::Symbol)
+    if alg == :RS256
+        return AWS_CAL_RSA_SIGNATURE_PKCS1_5_SHA256
+    elseif alg == :PS256
+        return AWS_CAL_RSA_SIGNATURE_PSS_SHA256
+    else
+        error("Unsupported RSA signature algorithm $(alg)")
+    end
+end
+
+function rsa_digest(alg::Symbol, signing_input::Vector{UInt8})
+    if alg in (:RS256, :PS256)
+        return SHA.sha256(signing_input)
+    else
+        error("Unsupported RSA digest for $(alg)")
+    end
+end
 
 function decode_pem(data::AbstractString)
     io = IOBuffer()
@@ -73,6 +108,52 @@ end
 normalize_key_bytes(data::AbstractString) = decode_pem(data)
 normalize_key_bytes(data::Vector{UInt8}) = copy(data)
 normalize_key_bytes(data::Base.CodeUnits{UInt8, String}) = normalize_key_bytes(String(data))
+
+const SODIUM_INITIALIZED = Base.RefValue(false)
+
+function ensure_sodium_initialized()
+    if !SODIUM_INITIALIZED[]
+        result = ccall((:sodium_init, LIBSODIUM), Cint, ())
+        result < 0 && error("sodium_init failed with code $(result)")
+        SODIUM_INITIALIZED[] = true
+    end
+end
+
+function ed25519_seed_keypair(seed::Vector{UInt8})
+    ensure_sodium_initialized()
+    length(seed) == ED25519_SEED_BYTES || error("Ed25519 seeds must be $(ED25519_SEED_BYTES) bytes")
+    public = Vector{UInt8}(undef, ED25519_PUBLIC_KEY_BYTES)
+    secret = Vector{UInt8}(undef, ED25519_SECRET_KEY_BYTES)
+    GC.@preserve seed public secret begin
+        result = ccall(
+            (:crypto_sign_ed25519_seed_keypair, LIBSODIUM),
+            Cint,
+            (Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
+            pointer(public),
+            pointer(secret),
+            pointer(seed),
+        )
+        result == 0 || error("Unable to derive Ed25519 keypair from seed")
+    end
+    return secret, public
+end
+
+function ed25519_public_from_secret(secret::Vector{UInt8})
+    ensure_sodium_initialized()
+    length(secret) == ED25519_SECRET_KEY_BYTES || error("Ed25519 secret keys must be $(ED25519_SECRET_KEY_BYTES) bytes")
+    public = Vector{UInt8}(undef, ED25519_PUBLIC_KEY_BYTES)
+    GC.@preserve secret public begin
+        result = ccall(
+            (:crypto_sign_ed25519_sk_to_pk, LIBSODIUM),
+            Cint,
+            (Ptr{UInt8}, Ptr{UInt8}),
+            pointer(public),
+            pointer(secret),
+        )
+        result == 0 || error("Unable to derive Ed25519 public key from secret key")
+    end
+    return public
+end
 
 function rsa_signer_from_bytes(raw)
     bytes = normalize_key_bytes(raw)
@@ -108,6 +189,20 @@ function ecc_signer_from_bytes(raw, curve::Symbol)
     return ECSigner(ECCKeyHandle(key_ptr), curve)
 end
 
+function eddsa_signer_from_bytes(raw)
+    bytes = normalize_key_bytes(raw)
+    if length(bytes) == ED25519_SECRET_KEY_BYTES
+        secret = bytes
+        public = ed25519_public_from_secret(secret)
+        return EdDSASigner(secret, public)
+    elseif length(bytes) == ED25519_SEED_BYTES
+        secret, public = ed25519_seed_keypair(bytes)
+        return EdDSASigner(secret, public)
+    else
+        error("Unsupported Ed25519 key length ($(length(bytes)))")
+    end
+end
+
 function allocate_byte_buf(capacity::Integer)
     buf = Ref(AwsCommon.aws_byte_buf(0, Ptr{UInt8}(C_NULL), 0, Ptr{AwsCommon.aws_allocator}(C_NULL)))
     res = AwsCommon.aws_byte_buf_init(buf, default_aws_allocator(), capacity)
@@ -126,13 +221,14 @@ end
 
 function sign_jws(signer::RSASigner, alg::Symbol, signing_input::Vector{UInt8})
     alg in SUPPORTED_RSA_ALGS || error("Unsupported RSA JWT alg $(alg)")
-    digest = SHA.sha256(signing_input)
+    digest = rsa_digest(alg, signing_input)
+    algorithm = rsa_signature_algorithm(alg)
     sig_buf = allocate_byte_buf(Int(aws_rsa_key_pair_signature_length(signer.key.ptr)))
     GC.@preserve digest begin
         cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
         result = aws_rsa_key_pair_sign_message(
             signer.key.ptr,
-            AWS_CAL_RSA_SIGNATURE_PKCS1_5_SHA256,
+            algorithm,
             cursor,
             sig_buf,
         )
@@ -167,15 +263,39 @@ function sign_jws(signer::ECSigner, alg::Symbol, signing_input::Vector{UInt8})
     return der_to_jws_signature(der_signature, size)
 end
 
+function sign_jws(signer::EdDSASigner, alg::Symbol, signing_input::Vector{UInt8})
+    alg in SUPPORTED_OKP_ALGS || error("Unsupported OKP alg $(alg)")
+    ensure_sodium_initialized()
+    signature = Vector{UInt8}(undef, ED25519_SIGNATURE_BYTES)
+    sig_len = Ref{Csize_t}(0)
+    secret = signer.secret
+    GC.@preserve signature signing_input secret begin
+        result = ccall(
+            (:crypto_sign_ed25519_detached, LIBSODIUM),
+            Cint,
+            (Ptr{UInt8}, Ptr{Csize_t}, Ptr{UInt8}, Culonglong, Ptr{UInt8}),
+            pointer(signature),
+            sig_len,
+            pointer(signing_input),
+            Culonglong(length(signing_input)),
+            pointer(secret),
+        )
+        result == 0 || error("Ed25519 signing failed (code $(result))")
+    end
+    sig_len[] == ED25519_SIGNATURE_BYTES || error("Incorrect Ed25519 signature length")
+    return signature
+end
+
 function verify_jws(verifier::RSAVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
     alg in SUPPORTED_RSA_ALGS || error("Unsupported RSA JWT alg $(alg)")
-    digest = SHA.sha256(signing_input)
+    digest = rsa_digest(alg, signing_input)
+    algorithm = rsa_signature_algorithm(alg)
     GC.@preserve digest signature begin
         digest_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
         sig_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(signature)), length(signature))
         result = aws_rsa_key_pair_verify_signature(
             verifier.key.ptr,
-            AWS_CAL_RSA_SIGNATURE_PKCS1_5_SHA256,
+            algorithm,
             digest_cursor,
             sig_cursor,
         )
@@ -201,6 +321,26 @@ function verify_jws(verifier::ECVerifier, alg::Symbol, signing_input::Vector{UIn
         return result == 0
     end
 end
+
+function verify_jws(verifier::EdDSAVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
+    alg in SUPPORTED_OKP_ALGS || error("Unsupported OKP alg $(alg)")
+    length(signature) == ED25519_SIGNATURE_BYTES || return false
+    ensure_sodium_initialized()
+    public = verifier.public
+    GC.@preserve signature signing_input public begin
+        result = ccall(
+            (:crypto_sign_ed25519_verify_detached, LIBSODIUM),
+            Cint,
+            (Ptr{UInt8}, Ptr{UInt8}, Culonglong, Ptr{UInt8}),
+            pointer(signature),
+            pointer(signing_input),
+            Culonglong(length(signing_input)),
+            pointer(public),
+        )
+        return result == 0
+    end
+end
+
 
 function algorithm_digest(alg::Symbol, input::Vector{UInt8})
     if alg in (:ES256, :RS256)
@@ -373,6 +513,13 @@ function decode_compact_jwt(token::AbstractString)
     return header, payload, signature, signing_input
 end
 
+function eddsa_verifier_from_bytes(raw)
+    ensure_sodium_initialized()
+    bytes = Vector{UInt8}(raw)
+    length(bytes) == ED25519_PUBLIC_KEY_BYTES || error("Ed25519 public keys must be $(ED25519_PUBLIC_KEY_BYTES) bytes")
+    return EdDSAVerifier(bytes)
+end
+
 function rsa_verifier_from_der(der::Vector{UInt8})
     alloc = default_aws_allocator()
     key_ptr = Ptr{aws_rsa_key_pair}(C_NULL)
@@ -392,7 +539,8 @@ end
 function ecc_public_coordinates(signer::ECSigner)
     x_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
     y_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
-    aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
+    result = aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
+    result == 0 || error("aws_ecc_key_pair_get_public_key failed with code $(result)")
     x_bytes = unsafe_wrap(Vector{UInt8}, x_ref[].ptr, x_ref[].len; own=false)
     y_bytes = unsafe_wrap(Vector{UInt8}, y_ref[].ptr, y_ref[].len; own=false)
     return copy(x_bytes), copy(y_bytes)

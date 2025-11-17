@@ -1,5 +1,56 @@
 const StringParams = Dict{String,String}
 
+import Base: push!
+
+ascii_lower(byte::UInt8) = (0x41 <= byte <= 0x5a) ? byte + 0x20 : byte
+
+function ascii_lc_isequal(a::AbstractString, b::AbstractString)
+    na = ncodeunits(a)
+    nb = ncodeunits(b)
+    na == nb || return false
+    ua = codeunits(a)
+    ub = codeunits(b)
+    for i in eachindex(ua, ub)
+        ascii_lower(ua[i]) == ascii_lower(ub[i]) || return false
+    end
+    return true
+end
+
+mutable struct FormParams
+    unique::Dict{String,String}
+    repeated::Vector{Pair{String,String}}
+end
+
+FormParams() = FormParams(Dict{String,String}(), Pair{String,String}[])
+
+function set!(form::FormParams, key, value)
+    form.unique[String(key)] = String(value)
+    return form
+end
+
+function push!(form::FormParams, key, value)
+    push!(form.repeated, String(key) => String(value))
+    return form
+end
+
+function append_pairs!(form::FormParams, pairs::Vector{Pair{String,String}})
+    for pair in pairs
+        push!(form.repeated, String(pair.first) => String(pair.second))
+    end
+    return form
+end
+
+function form_pairs(form::FormParams; sort_unique::Bool=true)
+    pairs = Pair{String,String}[]
+    unique_keys = collect(keys(form.unique))
+    sort_unique && sort!(unique_keys)
+    for key in unique_keys
+        push!(pairs, key => form.unique[key])
+    end
+    append!(pairs, form.repeated)
+    return pairs
+end
+
 struct LoopbackListener
     server::HTTP.Server
     task::Task
@@ -23,6 +74,20 @@ function normalize_headers(headers)
     else
         return HTTP.Headers(headers)
     end
+end
+
+prepare_headers(headers) = HTTP.Headers(normalize_headers(headers))
+
+function set_request_header!(headers, key::AbstractString, value::AbstractString)
+    for idx in eachindex(headers)
+        header_pair = headers[idx]
+        if ascii_lc_isequal(String(header_pair.first), key)
+            headers[idx] = String(key) => String(value)
+            return headers
+        end
+    end
+    push!(headers, String(key) => String(value))
+    return headers
 end
 
 function normalize_body(body)
@@ -97,11 +162,47 @@ form_escape(value) = form_escape(string(value))
 escape_pair(pair::Pair{String,String}) = string(form_escape(pair.first), '=', form_escape(pair.second))
 
 function encode_form(fields::Dict{String,String})
-    ordered = sort(collect(keys(fields)))
-    return join((escape_pair((key => fields[key])) for key in ordered), '&')
+    form = FormParams()
+    for (k, v) in fields
+        set!(form, k, v)
+    end
+    return encode_form(form; sort_keys=true)
 end
 
-random_state(; rng=Random.GLOBAL_RNG, bytes=16) = base64url(rand(rng, UInt8, bytes))
+function encode_form(pairs::Vector{Pair{String,String}})
+    return join((escape_pair(pair) for pair in pairs), '&')
+end
+
+function encode_form(form::FormParams; sort_keys::Bool=true)
+    return encode_form(form_pairs(form; sort_unique=sort_keys))
+end
+
+function normalize_string_params(params)
+    string_params = StringParams()
+    params === nothing && return string_params
+    for (k, v) in params
+        string_params[String(k)] = String(v)
+    end
+    return string_params
+end
+
+"""
+    secure_random_bytes(len; rng=RandomDevice())
+
+Return `len` uniformly distributed bytes sourced from a cryptographically secure RNG.
+Always prefer this helper when generating OAuth secrets (state, PKCE verifiers, JWT IDs, etc.)
+to avoid regressions that fall back to non-secure RNGs.
+"""
+function secure_random_bytes(len::Integer; rng=nothing)
+    len > 0 || throw(ArgumentError("len must be positive"))
+    source = rng === nothing ? RandomDevice() : rng
+    return rand(source, UInt8, len)
+end
+
+function random_state(; rng=nothing, bytes=16)
+    bytes > 0 || throw(ArgumentError("bytes must be positive"))
+    return base64url(secure_random_bytes(bytes; rng=rng))
+end
 
 ensure_slash(path::AbstractString) = startswith(path, "/") ? String(path) : "/" * String(path)
 

@@ -1,11 +1,12 @@
 const PKCE_VERIFIER_MIN = 43
 const PKCE_VERIFIER_MAX = 128
 
-function generate_pkce_verifier(; rng=Random.GLOBAL_RNG, bytes=32)
+function generate_pkce_verifier(; rng=nothing, bytes=32)
     bytes > 0 || throw(ArgumentError("bytes must be positive"))
     verifier = ""
+    source = rng === nothing ? RandomDevice() : rng
     while !within_pkce_length(verifier)
-        seed = rand(rng, UInt8, bytes)
+        seed = secure_random_bytes(bytes; rng=source)
         verifier = base64url(seed)
     end
     return PKCEVerifier(verifier)
