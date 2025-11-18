@@ -21,6 +21,24 @@ function ensure_https_fields(metadata::AuthorizationServerMetadata)
     end
 end
 
+"""
+    fetch_protected_resource_metadata(url; headers=HTTP.Headers(), http=HTTP, verbose=false, kwargs...)
+
+Downloads the OAuth 2.0 Protected Resource Metadata document defined by
+RFC 8414/8707 and converts it into a convenient
+[`ProtectedResourceMetadata`](@ref) struct.  The helper enforces HTTPS,
+handles non-200 responses, and raises `OAuthError` with helpful messages
+when JSON parsing fails.
+
+# Examples
+```julia
+julia> metadata = fetch_protected_resource_metadata(
+           \"https://payments.example/.well-known/oauth-protected-resource\";
+           verbose = true,
+       )
+ProtectedResourceMetadata(…)
+```
+"""
 function fetch_protected_resource_metadata(url::AbstractString; headers=HTTP.Headers(), http=HTTP, verbose::Bool=false, kwargs...)
     ensure_https_url(url, "Protected resource metadata URL")
     resp = http_request(http, "GET", url; headers=headers, verbose=verbose, DEFAULT_TIMEOUT..., kwargs...)
@@ -31,6 +49,22 @@ function fetch_protected_resource_metadata(url::AbstractString; headers=HTTP.Hea
     return ProtectedResourceMetadata(json)
 end
 
+"""
+    fetch_authorization_server_metadata(issuer; headers=HTTP.Headers(), http=HTTP, verbose=false, kwargs...)
+
+Reads the `.well-known/oauth-authorization-server` or
+`.well-known/openid-configuration` document for the given `issuer` URL and
+returns an [`AuthorizationServerMetadata`](@ref) value.  The function
+follows the fallback order recommended by the spec, double-checks the
+issuer identifier inside the document, and verifies that the endpoints are
+HTTPS.
+
+# Examples
+```julia
+julia> auth = fetch_authorization_server_metadata(\"https://id.example\")
+AuthorizationServerMetadata(issuer = \"https://id.example\", …)
+```
+"""
 function fetch_authorization_server_metadata(issuer::AbstractString; headers=HTTP.Headers(), http=HTTP, verbose::Bool=false, kwargs...)
     issuer_url = strip_trailing_slash(String(issuer))
     ensure_https_url(issuer_url, "Issuer URL")
@@ -65,6 +99,21 @@ function fetch_authorization_server_metadata(issuer::AbstractString; headers=HTT
     throw(OAuthError(:metadata_error, "Unable to fetch authorization server metadata for issuer $issuer_url"))
 end
 
+"""
+    discover_oauth_metadata(prm_url; issuer=nothing, headers=HTTP.Headers(), http=HTTP, verbose=false)
+
+One-stop helper that first grabs the protected resource metadata at
+`prm_url`, then follows the resource’s declared authorization servers (or a
+specific `issuer` you supply) to fetch issuer metadata.  Returns an
+[`OAuthDiscoveryContext`](@ref) with everything you need to kick off a
+client flow.
+
+# Examples
+```julia
+julia> discovery = discover_oauth_metadata(\"https://api.example/.well-known/oauth-resource\")
+OAuthDiscoveryContext(authorization_server = AuthorizationServerMetadata(...), …)
+```
+"""
 function discover_oauth_metadata(prm_url::AbstractString; issuer::Union{Nothing,AbstractString}=nothing, headers=HTTP.Headers(), http=HTTP, verbose::Bool=false, kwargs...)
     resource_meta = fetch_protected_resource_metadata(prm_url; headers=headers, http=http, verbose=verbose, kwargs...)
     issuer_url = select_authorization_server(resource_meta; issuer=issuer)
@@ -72,11 +121,36 @@ function discover_oauth_metadata(prm_url::AbstractString; issuer::Union{Nothing,
     return OAuthDiscoveryContext(auth_meta, resource_meta)
 end
 
+"""
+    discover_oauth_metadata_from_issuer(issuer_url; headers=HTTP.Headers(), http=HTTP, verbose=false)
+
+Fetches the metadata for a standalone authorization server when you do not
+have a protected resource document.  Returns an [`OAuthDiscoveryContext`](@ref)
+with a `resource = nothing` placeholder, which still plugs directly into
+the higher-level PKCE helpers.
+"""
 function discover_oauth_metadata_from_issuer(issuer_url::AbstractString; headers=HTTP.Headers(), http=HTTP, verbose::Bool=false, kwargs...)
     auth_meta = fetch_authorization_server_metadata(issuer_url; headers=headers, http=http, verbose=verbose, kwargs...)
     return OAuthDiscoveryContext(auth_meta, nothing)
 end
 
+"""
+    select_authorization_server(resource_metadata; issuer=nothing) -> String
+
+Chooses which authorization server to talk to for a given protected
+resource.  When `issuer` is `nothing`, the first advertised entry wins.
+When you pass an explicit issuer URL, the helper validates that the URL was
+advertised by the resource metadata and raises an `OAuthError` otherwise.
+
+# Examples
+```julia
+julia> select_authorization_server(resource_metadata)
+\"https://idp.example\"
+
+julia> select_authorization_server(resource_metadata; issuer = \"https://idp2.example\")
+ERROR: OAuthError(metadata_error): Issuer https://idp2.example not found in resource metadata
+```
+"""
 function select_authorization_server(metadata::ProtectedResourceMetadata; issuer::Union{Nothing,AbstractString}=nothing)
     isempty(metadata.authorization_servers) && throw(OAuthError(:metadata_error, "No authorization servers declared by resource"))
     if issuer !== nothing

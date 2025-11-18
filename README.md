@@ -157,6 +157,23 @@ result = complete_pkce_authorization(
 access_token = result.token
 ```
 
+To persist refresh tokens between runs without wiring up callbacks, point a `FileBasedRefreshTokenStore` at a path on disk:
+
+```julia
+store = FileBasedRefreshTokenStore(expanduser("~/.config/myapp/refresh-token.json"))
+
+client = PublicClientConfig(
+    client_id = "desktop-app",
+    redirect_uri = "http://127.0.0.1:8765/callback",
+    scopes = ["openid", "profile", "payments.read"],
+    refresh_token_store = store,
+)
+```
+
+The file helper writes a tiny JSON blob—`{"version":1,"encoding":"base64","token":"…"}`—where the token body is base64 encoded so it is not sitting in obvious plain text when you open the file. Base64 only provides light obfuscation, so rely on the filesystem for real protection; on POSIX platforms the store calls `chmod 0o600` by default, and you can pass `permissions = nothing` to skip that step if you need to manage permissions yourself.
+
+Each read/write is wrapped in [`FileWatching.mkpidlock`](https://docs.julialang.org/en/v1/stdlib/FileWatching/#FileWatching.mkpidlock), so multiple Julia processes (or REPLs) pointing at the same file will serialize access. Override `lock_path` or `stale_age` when constructing the store if you need to place the pidfile somewhere else or adjust how aggressively stale locks are reclaimed.
+
 Refresh tokens are persisted via the configured `RefreshTokenStore`, and the helpers automatically carry over `resource` and `authorization_details` to refresh requests. The simplest way is to pass the result directly:
 
 ```julia

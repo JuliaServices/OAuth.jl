@@ -276,6 +276,14 @@ function apply_token_endpoint_auth!(
     end
 end
 
+"""
+    build_authorization_url(request::AuthorizationRequest) -> String
+
+Percent-encodes every parameter contained in an [`AuthorizationRequest`](@ref)
+and returns the ready-to-launch URL.  Used internally by `start_pkce_authorization`,
+but you can call it when you want to hand-craft the request struct first
+(for example to tweak `authorization_details`).
+"""
 function build_authorization_url(request::AuthorizationRequest)
     params = authorization_request_pairs(request)
     query = join(escape_pair.(params), '&')

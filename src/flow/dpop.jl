@@ -17,6 +17,26 @@ function requires_dpop_nonce_retry(resp::HTTP.Response)
     return false
 end
 
+"""
+    oauth_request(http, method, url; token, config=nothing, dpop=nothing, headers=HTTP.Headers(), body=nothing, verbose=false, max_nonce_retries=1, kwargs...)
+
+Lightweight wrapper around `HTTP.request` that automatically attaches your
+access token plus optional DPoP proof.  If the resource server tells us to
+retry with a fresh nonce, the helper caches it and resubmits the request up
+to `max_nonce_retries` times.  Pass either a `config` (whose `dpop` field
+will be used) or an explicit `dpop` credential.
+
+# Examples
+```julia
+resp = oauth_request(
+    HTTP,
+    \"GET\",
+    \"https://api.example/payments\";
+    token = token_response,
+    config = public_config,
+)
+```
+"""
 function oauth_request(
     http,
     method::AbstractString,

@@ -1,24 +1,188 @@
 const JSONObject = JSON.Object{String,Any}
 
+"""
+    RefreshTokenStore
+
+Abstract interface for persisting refresh tokens between OAuth sessions.
+Concrete stores implement three simple methods—`load_refresh_token`,
+`save_refresh_token!`, and `clear_refresh_token!`—so that the higher-level
+PKCE helpers can securely remember long-lived refresh tokens without you
+writing boilerplate.
+"""
 abstract type RefreshTokenStore end
 
+"""
+    InMemoryRefreshTokenStore()
+
+Minimal refresh token holder that keeps the token only in process memory.
+Great for short-lived CLI tools or testing, but tokens are lost when your
+process exits.
+
+# Examples
+```julia
+julia> store = InMemoryRefreshTokenStore();
+julia> save_refresh_token!(store, cfg, \"REFRESH123\")
+julia> load_refresh_token(store, cfg)
+\"REFRESH123\"
+```
+"""
 struct InMemoryRefreshTokenStore <: RefreshTokenStore
     token::Base.RefValue{Union{Nothing,String}}
 end
 
 InMemoryRefreshTokenStore() = InMemoryRefreshTokenStore(Base.RefValue{Union{Nothing,String}}(nothing))
 
+"""
+    FileBasedRefreshTokenStore(path; permissions=0o600, lock_path=nothing, stale_age=30)
+
+Persists refresh tokens on disk with optional POSIX permissions and a PID
+lockfile to guard against concurrent writes.  Use this from desktop apps
+that need to stay logged in between runs.
+"""
+struct FileBasedRefreshTokenStore <: RefreshTokenStore
+    path::String
+    permissions::Union{Nothing,UInt}
+    lock_path::String
+    lock_stale_age::Float64
+end
+
+const DEFAULT_REFRESH_TOKEN_LOCK_STALE_AGE = 30.0
+
+"""
+    FileBasedRefreshTokenStore(path; permissions=0o600, lock_path="$path.lock", stale_age=30)
+
+Helper constructor that normalizes user paths, lock file locations, and
+permission bits for `FileBasedRefreshTokenStore`.  The defaults mirror the
+security recommendations from the OAuth 2.0 Security BCP—only the current
+user can read the file, and PID lock files expire after 30 seconds to avoid
+wedging the store if a process crashes.
+"""
+function FileBasedRefreshTokenStore(path::AbstractString; permissions::Union{Integer,Nothing}=0o600, lock_path::Union{AbstractString,Nothing}=nothing, stale_age::Real=DEFAULT_REFRESH_TOKEN_LOCK_STALE_AGE)
+    perm_value = permissions === nothing ? nothing : UInt(permissions)
+    resolved_path = expanduser(String(path))
+    resolved_lock = lock_path === nothing ? string(resolved_path, ".lock") : expanduser(String(lock_path))
+    stale = stale_age <= 0 ? 0.0 : Float64(stale_age)
+    return FileBasedRefreshTokenStore(resolved_path, perm_value, resolved_lock, stale)
+end
+
+const REFRESH_TOKEN_FILE_VERSION = 1
+const REFRESH_TOKEN_FILE_ENCODING = "base64"
+
+function refresh_token_file_contents(token::String)
+    payload = Dict(
+        "version" => REFRESH_TOKEN_FILE_VERSION,
+        "encoding" => REFRESH_TOKEN_FILE_ENCODING,
+        "token" => Base64.base64encode(token),
+    )
+    return JSON.json(payload) * "\n"
+end
+
+refresh_token_dir(path::AbstractString) = begin
+    dir = dirname(path)
+    return isempty(dir) ? "." : dir
+end
+
+function ensure_refresh_token_dir(path::AbstractString)
+    dir = refresh_token_dir(path)
+    if dir != "." && !isdir(dir)
+        mkpath(dir)
+    end
+end
+
+function apply_refresh_token_permissions(path::AbstractString, permissions::Union{Nothing,UInt}, verbose::Bool)
+    permissions === nothing && return
+    try
+        chmod(path, Int(permissions))
+    catch err
+        verbose && @warn "Unable to set permissions on refresh token file" path=path err=err
+    end
+end
+
+function decode_refresh_token_document(raw::String)
+    stripped = strip(raw)
+    isempty(stripped) && return nothing
+    parsed = try
+        JSON.parse(stripped)
+    catch _
+        nothing
+    end
+    if parsed isa AbstractDict
+        token_value = get(parsed, "token", nothing)
+        token_value isa AbstractString || return nothing
+        version_value = get(parsed, "version", REFRESH_TOKEN_FILE_VERSION)
+        version = if version_value isa Integer
+            version_value
+        elseif version_value isa AbstractString
+            tryparse(Int, String(version_value))
+        elseif version_value isa Real
+            Int(floor(version_value))
+        else
+            nothing
+        end
+        version === nothing && return nothing
+        version == REFRESH_TOKEN_FILE_VERSION || return nothing
+        encoding = get(parsed, "encoding", REFRESH_TOKEN_FILE_ENCODING)
+        if encoding == REFRESH_TOKEN_FILE_ENCODING
+            decoded = try
+                Base64.base64decode(String(token_value))
+            catch _
+                nothing
+            end
+            return decoded === nothing ? nothing : String(decoded)
+        elseif encoding == "plain"
+            return String(token_value)
+        else
+            return nothing
+        end
+    end
+    return stripped
+end
+
+function with_refresh_token_lock(f::Function, store::FileBasedRefreshTokenStore, verbose::Bool)
+    ensure_refresh_token_dir(store.lock_path)
+    try
+        return mkpidlock(store.lock_path; stale_age=store.lock_stale_age) do
+            f()
+        end
+    catch err
+        verbose && @warn "Failed to acquire refresh token file lock" path=store.lock_path err=err
+        rethrow(err)
+    end
+end
+
+"""
+    CallbackRefreshTokenStore(; load, save, clear=nothing)
+
+Adapter that lets you plug arbitrary storage backends (a password manager,
+Keychain, cloud secret store, etc.) into the refresh-token lifecycle using
+plain Julia callables.  Provide lambdas for `load`, `save`, and optionally
+`clear`; the PKCE helpers will call them at the right moments.
+"""
 struct CallbackRefreshTokenStore{L,S,C} <: RefreshTokenStore
     load_callback::L
     save_callback::S
     clear_callback::C
 end
 
+"""
+    CallbackRefreshTokenStore(; load, save, clear=nothing)
+
+Builds a `CallbackRefreshTokenStore` from the supplied callables.  Each
+callable receives the `PublicClientConfig` so you can key off client IDs or
+redirect URIs when persisting secrets.
+"""
 function CallbackRefreshTokenStore(; load, save, clear=nothing)
     clear_fn = clear === nothing ? (_config) -> nothing : clear
     return CallbackRefreshTokenStore(load, save, clear_fn)
 end
 
+"""
+    WWWAuthenticateChallenge
+
+Small utility struct produced by [`parse_www_authenticate`](@ref).  It
+captures the challenge `scheme` (e.g. `\"Bearer\"`, `\"DPoP\"`), an
+optional bare `token`, and parsed key/value parameters.
+"""
 Base.@kwdef struct WWWAuthenticateChallenge
     scheme::String
     token::Union{String,Nothing}
@@ -30,6 +194,13 @@ WWWAuthenticateChallenge(scheme::AbstractString; token=nothing, params=Dict{Stri
 
 realm(ch::WWWAuthenticateChallenge) = get(ch.params, "realm", nothing)
 
+"""
+    ProtectedResourceMetadata
+
+Structured view over the JSON document described in RFC 8414 §4.  Use it to
+determine which authorization servers protect a resource, the default
+scopes, and documentation URLs.
+"""
 Base.@kwdef struct ProtectedResourceMetadata
     resource::Union{String,Nothing}
     authorization_servers::Vector{String}
@@ -64,6 +235,13 @@ function ProtectedResourceMetadata(data::JSONObject)
     )
 end
 
+"""
+    AuthorizationServerMetadata
+
+Container for the giant OpenID Connect Discovery document plus OAuth
+extensions (PAR, CIBA, etc.).  The fields mirror common metadata names so
+completions in the REPL are easy to discover.
+"""
 Base.@kwdef struct AuthorizationServerMetadata
     issuer::Union{String,Nothing}
     authorization_endpoint::Union{String,Nothing}
@@ -136,6 +314,13 @@ function effective_scope_list(scopes::Vector{String}, resource::Union{ProtectedR
     return metadata_scopes(resource, metadata)
 end
 
+"""
+    OAuthDiscoveryContext
+
+Bundle returned by [`discover_oauth_metadata`](@ref) that tucks together an
+authorization server’s metadata, an optional protected resource metadata
+document, and some convenience fields such as combined scopes.
+"""
 Base.@kwdef struct OAuthDiscoveryContext
     authorization_server::AuthorizationServerMetadata
     resource::Union{ProtectedResourceMetadata,Nothing}
@@ -156,13 +341,35 @@ function OAuthDiscoveryContext(auth::AuthorizationServerMetadata, resource::Unio
     )
 end
 
+"""
+    TokenEndpointAuth
+
+Marker abstract type for all credential strategies that can be used when a
+client hits the token endpoint.  Concrete implementations encapsulate the
+data required for HTTP Basic secrets, JWT client assertions, or mutual TLS.
+"""
 abstract type TokenEndpointAuth end
 
+"""
+    ClientSecretAuth(method::Symbol, secret::String)
+
+Wraps the classic client-secret authentication modes (`client_secret_basic`
+or `client_secret_post`).  Construct via [`ClientSecretAuth(::AbstractString; method=:client_secret_basic)`](@ref)
+to normalize arguments.
+"""
 struct ClientSecretAuth <: TokenEndpointAuth
     method::Symbol
     secret::String
 end
 
+"""
+    ClientSecretJWTAuth(secret::Vector{UInt8}, alg::Symbol, expires_in::Int, clock_skew::Int, extra_claims::Dict)
+
+Holds enough information to mint `client_secret_jwt` assertions on demand.
+You almost always want to call the keyword constructor
+[`ClientSecretJWTAuth(::AbstractString; alg=:HS256, ...)`](@ref) instead of
+creating this struct manually.
+"""
 struct ClientSecretJWTAuth <: TokenEndpointAuth
     secret::Vector{UInt8}
     alg::Symbol
@@ -171,6 +378,13 @@ struct ClientSecretJWTAuth <: TokenEndpointAuth
     extra_claims::Dict{String,Any}
 end
 
+"""
+    PrivateKeyJWTAuth(signer::JWTSigner, alg::Symbol, kid, audience, expires_in, clock_skew, extra_claims)
+
+Encapsulates a `private_key_jwt` credential.  Created through the keyword
+constructor that accepts a PEM/DER private key and optional metadata such
+as `kid` or `audience`.
+"""
 struct PrivateKeyJWTAuth <: TokenEndpointAuth
     signer::JWTSigner
     alg::Symbol
@@ -181,11 +395,25 @@ struct PrivateKeyJWTAuth <: TokenEndpointAuth
     extra_claims::Dict{String,Any}
 end
 
+"""
+    TLSClientAuth(; method=:tls_client_auth, sslconfig)
+
+Wraps mutual-TLS client credential material (typically an `MbedTLS.SSLConfig`)
+so the token endpoint helpers know both which TLS auth method to announce
+and which configuration object to thread into HTTP requests.
+"""
 struct TLSClientAuth{C} <: TokenEndpointAuth
     method::Symbol
     sslconfig::C
 end
 
+"""
+    TLSClientAuth(sslconfig; method=:tls_client_auth)
+
+Wraps a mutual-TLS configuration value (for example the result of
+`MbedTLS.SSLConfig(clientcert=…, key=…)`) together with the advertised auth
+method so token requests automatically add the required `client_id`.
+"""
 function TLSClientAuth(sslconfig; method::Union{Symbol,AbstractString}=:tls_client_auth)
     method_symbol = method isa Symbol ? method : Symbol(method)
     method_symbol in (:tls_client_auth, :self_signed_tls_client_auth) || throw(ArgumentError("Unsupported TLS client auth method: $(method_symbol)"))
@@ -193,17 +421,38 @@ function TLSClientAuth(sslconfig; method::Union{Symbol,AbstractString}=:tls_clie
     return TLSClientAuth{typeof(sslconfig)}(method_symbol, sslconfig)
 end
 
+"""
+    DPoPNonceCache(; ttl_seconds=300)
+
+Thread-safe in-memory cache that remembers the most recent nonce each
+authorization server demanded for a given origin, allowing the client to
+retry DPoP requests automatically.
+"""
 mutable struct DPoPNonceCache
     lock::Base.ReentrantLock
     entries::Dict{String,Tuple{String,DateTime}}
     ttl::Dates.Second
 end
 
+"""
+    DPoPNonceCache(; ttl_seconds=300)
+
+Builds a nonce cache with the desired time-to-live.  The cache evicts old
+nonces lazily whenever a new nonce is inserted or looked up, so you can
+safely reuse it between many HTTP requests.
+"""
 function DPoPNonceCache(; ttl_seconds::Integer=300)
     ttl_seconds > 0 || throw(ArgumentError("ttl_seconds must be positive"))
     return DPoPNonceCache(Base.ReentrantLock(), Dict{String,Tuple{String,DateTime}}(), Dates.Second(ttl_seconds))
 end
 
+"""
+    DPoPAuth
+
+Holds everything required to sign DPoP proofs: the EC signer, the public
+JWK that will be embedded in proofs, the computed thumbprint, and a nonce
+cache.  Build via [`DPoPAuth(; private_key=…, public_jwk=… )`](@ref).
+"""
 struct DPoPAuth
     signer::ECSigner
     alg::Symbol
@@ -214,6 +463,14 @@ struct DPoPAuth
     nonce_cache::DPoPNonceCache
 end
 
+"""
+    RequestObjectSigner
+
+Encapsulates the inputs required to sign JWT request objects (PAR or direct
+`request` parameter).  Created through the keyword constructor that accepts
+private keys, algorithm selections, optional `kid`, and any extra claims to
+embed.
+"""
 struct RequestObjectSigner
     signer::JWTSigner
     alg::Symbol
@@ -224,6 +481,14 @@ struct RequestObjectSigner
     extra_claims::Dict{String,Any}
 end
 
+"""
+    RequestObjectSigner(; private_key, alg=:RS256, kid=nothing, audience=nothing, expires_in=300, clock_skew=60, extra_claims=Dict())
+
+Builds a signer from your PEM/DER key material.  The helper figures out the
+correct signer type (RSA, EC, or EdDSA) based on `alg`, enforces that the
+authorization server allows the algorithm, and normalizes claim names to
+strings.
+"""
 function RequestObjectSigner(; private_key, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, audience=nothing, expires_in::Integer=300, clock_skew::Integer=60, extra_claims=Dict{String,Any}())
     alg_symbol = Symbol(uppercase(String(alg)))
     signer = if alg_symbol in SUPPORTED_RSA_ALGS
@@ -251,6 +516,14 @@ function RequestObjectSigner(; private_key, alg::Union{Symbol,AbstractString}=:R
     )
 end
 
+"""
+    ConfidentialClientConfig
+
+Configuration bundle for OAuth clients that can keep credentials secret
+(service daemons, servers).  Holds the `client_id`, the chosen token
+endpoint credential, default scopes/resources, and advanced knobs such as
+DPoP and pushed authorization requests.
+"""
 struct ConfidentialClientConfig{T<:TokenEndpointAuth}
     client_id::String
     credential::T
@@ -262,6 +535,14 @@ struct ConfidentialClientConfig{T<:TokenEndpointAuth}
     verbose::Bool
 end
 
+"""
+    PublicClientConfig
+
+Configuration for apps that cannot keep a secret (CLIs, native apps, SPAs).
+Along with identifiers and scopes it stores optional DPoP credentials,
+refresh token persistence hooks, and whether to prefer pushed authorization
+requests or signed request objects.
+"""
 struct PublicClientConfig
     client_id::String
     redirect_uri::Union{String,Nothing}
@@ -277,6 +558,12 @@ struct PublicClientConfig
     verbose::Bool
 end
 
+"""
+    ClientSecretAuth(secret; method=:client_secret_basic)
+
+Normalizes raw strings or symbols into a `ClientSecretAuth` credential.
+Raises `ArgumentError` if you request an unsupported method.
+"""
 function ClientSecretAuth(secret::AbstractString; method::Union{Symbol,AbstractString}=:client_secret_basic)
     method_symbol = method isa Symbol ? method : Symbol(method)
     method_symbol in (:client_secret_basic, :client_secret_post) || throw(ArgumentError("Unsupported client secret auth method: $(method_symbol)"))
@@ -285,6 +572,13 @@ end
 
 const SUPPORTED_CLIENT_SECRET_JWT_ALGS = Set([:HS256, :HS384, :HS512])
 
+"""
+    ClientSecretJWTAuth(secret; alg=:HS256, expires_in=300, clock_skew=60, extra_claims=Dict())
+
+Builds a `client_secret_jwt` credential using the supplied shared secret.
+`extra_claims` lets you insert additional JWT claims (such as `\"tenant\"`)
+into every assertion.
+"""
 function ClientSecretJWTAuth(secret::AbstractString; alg::Union{Symbol,AbstractString}=:HS256, expires_in::Integer=300, clock_skew::Integer=60, extra_claims=Dict{String,Any}())
     alg_symbol = Symbol(uppercase(String(alg)))
     alg_symbol in SUPPORTED_CLIENT_SECRET_JWT_ALGS || throw(ArgumentError("Unsupported client_secret_jwt alg $(alg_symbol)"))
@@ -295,6 +589,13 @@ function ClientSecretJWTAuth(secret::AbstractString; alg::Union{Symbol,AbstractS
     return ClientSecretJWTAuth(Vector{UInt8}(codeunits(String(secret))), alg_symbol, Int(expires_in), Int(clock_skew), claims)
 end
 
+"""
+    PrivateKeyJWTAuth(; private_key, alg=:RS256, kid=nothing, audience=nothing, expires_in=300, clock_skew=60, extra_claims=Dict())
+
+Loads the private key material (PKCS#8/PKCS#1/Ed25519) and builds a
+`PrivateKeyJWTAuth` credential ready for use with the token endpoint.  Use
+this when you received a private key during dynamic client registration.
+"""
 function PrivateKeyJWTAuth(; private_key, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, audience=nothing, expires_in::Integer=300, clock_skew::Integer=60, extra_claims=Dict{String,Any}())
     alg_symbol = Symbol(uppercase(String(alg)))
     signer = if alg_symbol in SUPPORTED_RSA_ALGS
@@ -322,6 +623,14 @@ function PrivateKeyJWTAuth(; private_key, alg::Union{Symbol,AbstractString}=:RS2
     )
 end
 
+"""
+    DPoPAuth(; private_key, public_jwk, alg=:ES256, kid=nothing, iat_skew=60, nonce_cache=nothing)
+
+Convenience constructor that reads a PEM/DER EC key, normalizes the public
+JWK map, computes its thumbprint, and equips the credential with a nonce
+cache.  Pass the same instance to both `oauth_request` and token endpoint
+helpers so nonce retries can coordinate.
+"""
 function DPoPAuth(; private_key, public_jwk, alg::Union{Symbol,AbstractString}=:ES256, kid=nothing, iat_skew::Integer=60, nonce_cache::Union{DPoPNonceCache,Nothing}=nothing)
     alg_symbol = alg isa Symbol ? alg : Symbol(alg)
     alg_symbol in SUPPORTED_EC_ALGS || throw(ArgumentError("DPoP requires ECDSA-based alg, got $(alg_symbol)"))
@@ -337,6 +646,24 @@ function DPoPAuth(; private_key, public_jwk, alg::Union{Symbol,AbstractString}=:
 end
 
 
+"""
+    ConfidentialClientConfig(; client_id, client_secret=nothing, credential=nothing, scopes=[], resources=[], authorization_details=nothing, additional_parameters=nothing, token_endpoint_auth_method=:client_secret_basic, dpop=nothing, verbose=false)
+
+Keyword constructor that keeps all the validation logic in one place: it
+ensures you either provide a ready-made `credential` or enough information
+(`client_secret` + `token_endpoint_auth_method`) to build one, copies scope
+and resource arrays so you can reuse inputs, and normalizes additional
+parameters to `Dict{String,String}`.
+
+# Examples
+```julia
+conf = ConfidentialClientConfig(
+    client_id = \"my-service\",
+    client_secret = ENV[\"CLIENT_SECRET\"],
+    scopes = [\"payments:write\"],
+)
+```
+"""
 function ConfidentialClientConfig(; client_id, client_secret=nothing, credential::Union{TokenEndpointAuth,Nothing}=nothing, scopes=String[], resources=String[], authorization_details=nothing, additional_parameters=nothing, token_endpoint_auth_method=:client_secret_basic, dpop::Union{DPoPAuth,Nothing}=nothing, verbose::Bool=false)
     scope_list = String[String(s) for s in scopes]
     resource_list = String[String(r) for r in resources]
@@ -361,6 +688,13 @@ function ConfidentialClientConfig(; client_id, client_secret=nothing, credential
     )
 end
 
+"""
+    PublicClientConfig(; client_id, redirect_uri=nothing, scopes=[], resources=[], authorization_details=nothing, additional_parameters=nothing, dpop=nothing, refresh_token_store=nothing, allow_plain_pkce=false, use_par=false, request_object_signer=nothing, verbose=false)
+
+Keyword constructor for `PublicClientConfig`.  It copies user-provided
+scope/resource arrays, normalizes optional redirect URIs, and stores
+whatever refresh-token persistence strategy you provide.
+"""
 function PublicClientConfig(; client_id, redirect_uri=nothing, scopes=String[], resources=String[], authorization_details=nothing, additional_parameters=nothing, dpop::Union{DPoPAuth,Nothing}=nothing, refresh_token_store::Union{RefreshTokenStore,Nothing}=nothing, allow_plain_pkce::Bool=false, use_par::Bool=false, request_object_signer::Union{RequestObjectSigner,Nothing}=nothing, verbose::Bool=false)
     scope_list = String[String(s) for s in scopes]
     resource_list = String[String(r) for r in resources]
@@ -402,6 +736,58 @@ function clear_refresh_token!(store::InMemoryRefreshTokenStore, ::PublicClientCo
     store.token[] = nothing
 end
 
+function load_refresh_token(store::FileBasedRefreshTokenStore, config::PublicClientConfig)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ispath(store.path) || return nothing
+        raw = try
+            read(store.path, String)
+        catch err
+            verbose && @warn "Failed to read refresh token file" path=store.path err=err
+            return nothing
+        end
+        token = decode_refresh_token_document(raw)
+        if token === nothing && verbose
+            @warn "Refresh token file did not contain a usable token" path=store.path
+        end
+        return token
+    end
+end
+
+function save_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicClientConfig, token::String)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ensure_refresh_token_dir(store.path)
+        dir = refresh_token_dir(store.path)
+        tmp = tempname(dir)
+        try
+            open(tmp, "w") do io
+                write(io, refresh_token_file_contents(token))
+            end
+            apply_refresh_token_permissions(tmp, store.permissions, verbose)
+            mv(tmp, store.path; force=true)
+            apply_refresh_token_permissions(store.path, store.permissions, verbose)
+        catch err
+            verbose && @warn "Failed to write refresh token file" path=store.path err=err
+            rethrow(err)
+        finally
+            ispath(tmp) && tmp != store.path && rm(tmp; force=true)
+        end
+    end
+end
+
+function clear_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicClientConfig)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ispath(store.path) || return
+        try
+            rm(store.path; force=true)
+        catch err
+            verbose && @warn "Failed to delete refresh token file" path=store.path err=err
+        end
+    end
+end
+
 function load_refresh_token(store::CallbackRefreshTokenStore, config::PublicClientConfig)
     return store.load_callback(config)
 end
@@ -414,15 +800,36 @@ function clear_refresh_token!(store::CallbackRefreshTokenStore, config::PublicCl
     store.clear_callback(config)
 end
 
+"""
+    load_refresh_token(config::PublicClientConfig) -> Union{String,Nothing}
+
+Asks the configured `RefreshTokenStore` (if any) for the most recently
+saved refresh token.  Most callers should use this overload rather than
+talking to the store directly.
+"""
 function load_refresh_token(config::PublicClientConfig)
     return load_refresh_token(config.refresh_token_store, config)
 end
 
+"""
+    save_refresh_token!(config::PublicClientConfig, token)
+
+Persists a newly issued refresh token via the configured store.  Passing
+`nothing` is a no-op, which makes it safe to feed in `TokenResponse.refresh_token`
+directly.
+"""
 function save_refresh_token!(config::PublicClientConfig, token::Union{String,Nothing})
     token === nothing && return
     save_refresh_token!(config.refresh_token_store, config, token)
 end
 
+"""
+    clear_refresh_token!(config::PublicClientConfig)
+
+Asks the underlying store to forget whatever refresh token it currently
+knows about.  Called automatically when a refresh attempt yields
+`invalid_grant`.
+"""
 function clear_refresh_token!(config::PublicClientConfig)
     clear_refresh_token!(config.refresh_token_store, config)
 end
@@ -434,6 +841,13 @@ config_verbose(config::PublicClientConfig) = config.verbose
 
 effective_verbose(source, verbose::Union{Bool,Nothing}) = verbose === nothing ? config_verbose(source) : verbose
 
+"""
+    AuthorizationRequest
+
+Internal representation of the parameters we eventually encode into an
+authorization URL, pushed authorization request, or JWT request object.
+Mostly useful if you need to inspect or override pieces of `build_authorization_url`.
+"""
 Base.@kwdef struct AuthorizationRequest
     authorization_endpoint::String
     response_type::String
@@ -450,10 +864,24 @@ Base.@kwdef struct AuthorizationRequest
     extra::Dict{String,String}
 end
 
+"""
+    PKCEVerifier
+
+Thin wrapper around the verifier string returned by
+[`generate_pkce_verifier`](@ref).  Helps the compiler prevent you from
+accidentally passing a raw verifier where a challenge was expected.
+"""
 struct PKCEVerifier
     verifier::String
 end
 
+"""
+    TokenResponse
+
+High-level view of a JSON token endpoint response.  Includes parsed fields
+such as `expires_at`, helper accessors for authorization_details/resource
+values, and the raw JSON payload so you can spelunk vendor extensions.
+"""
 Base.@kwdef struct TokenResponse
     access_token::String
     token_type::String
@@ -470,6 +898,13 @@ Base.@kwdef struct TokenResponse
     raw::JSONObject
 end
 
+"""
+    DeviceAuthorizationResponse
+
+Parsed representation of `device_authorization` responses, including the
+server-specified polling interval and computed expiration timestamp.  Feed
+it straight into [`poll_device_authorization_token`](@ref).
+"""
 Base.@kwdef struct DeviceAuthorizationResponse
     device_code::String
     user_code::String
@@ -868,6 +1303,14 @@ cache_dpop_nonce!(auth::DPoPAuth, url::AbstractString, nonce::AbstractString; no
 cached_dpop_nonce(auth::DPoPAuth, url::AbstractString; now::DateTime=now(UTC)) =
     cached_dpop_nonce(auth.nonce_cache, url; now=now)
 
+"""
+    AuthorizationSession
+
+Returned by [`start_pkce_authorization`](@ref).  Captures the generated PKCE
+verifier, state, discovery metadata, and optional loopback listener so you
+have everything needed to call [`wait_for_authorization_code`](@ref) or
+[`finalize_pkce_session`](@ref).
+"""
 Base.@kwdef struct AuthorizationSession
     authorization_url::String
     redirect_uri::String

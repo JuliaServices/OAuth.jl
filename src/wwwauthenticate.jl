@@ -1,3 +1,22 @@
+"""
+    parse_www_authenticate(header::AbstractString) -> Vector{WWWAuthenticateChallenge}
+
+Parses the exact contents of an RFC 7235 `WWW-Authenticate` header into a
+structured list of `WWWAuthenticateChallenge` values.  The parser handles a
+mix of tokens, quoted strings, extension parameters, and even homespun
+servers that stuff extra commas into the header.
+
+# Examples
+```julia
+julia> header = \"Bearer realm=\\\"example\\\", error=\\\"invalid_token\\\"\" *
+                \", DPoP nonce=\\\"abc123\\\"\";
+
+julia> parse_www_authenticate(header)
+2-element Vector{WWWAuthenticateChallenge}:
+ WWWAuthenticateChallenge(\"Bearer\", nothing, Dict(\"realm\" => \"example\", \"error\" => \"invalid_token\"))
+ WWWAuthenticateChallenge(\"DPoP\", nothing, Dict(\"nonce\" => \"abc123\"))
+```
+"""
 function parse_www_authenticate(header::AbstractString)
     challenges = WWWAuthenticateChallenge[]
     idx = firstindex(header)

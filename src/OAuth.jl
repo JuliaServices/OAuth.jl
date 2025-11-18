@@ -1,6 +1,6 @@
 module OAuth
 
-using Dates, HTTP, JSON, Random, SHA, Base64, LibAwsCal, LibAwsCommon
+using Dates, HTTP, JSON, Random, SHA, Base64, LibAwsCal, LibAwsCommon, FileWatching
 
 const DEFAULT_RESPONSE_TYPE = "code"
 const MAX_DPOP_NONCE_RETRIES = 1
@@ -25,7 +25,7 @@ export WWWAuthenticateChallenge, parse_www_authenticate
 export ProtectedResourceMetadata, AuthorizationServerMetadata, OAuthDiscoveryContext, TokenResponse
 export ConfidentialClientConfig, PublicClientConfig, AuthorizationRequest, PKCEVerifier, RequestObjectSigner
 export ClientSecretAuth, ClientSecretJWTAuth, PrivateKeyJWTAuth, TLSClientAuth, DPoPAuth, DPoPNonceCache
-export RefreshTokenStore, InMemoryRefreshTokenStore, CallbackRefreshTokenStore
+export RefreshTokenStore, InMemoryRefreshTokenStore, FileBasedRefreshTokenStore, CallbackRefreshTokenStore
 export LoopbackListener, AuthorizationSession
 export fetch_protected_resource_metadata, fetch_authorization_server_metadata, discover_oauth_metadata, discover_oauth_metadata_from_issuer
 export select_authorization_server

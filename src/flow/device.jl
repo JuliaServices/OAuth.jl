@@ -1,5 +1,13 @@
  
 
+"""
+    start_device_authorization(metadata, config; http=HTTP, extra_params=Dict(), verbose=nothing, resource_metadata=nothing) -> DeviceAuthorizationResponse
+
+Implements the [`device_authorization`](https://datatracker.ietf.org/doc/html/rfc8628) request.
+Constructs the form body with scopes/resources, attaches client
+authentication, and parses the JSON reply into a
+[`DeviceAuthorizationResponse`](@ref).
+"""
 function start_device_authorization(
     metadata::AuthorizationServerMetadata,
     config::Union{PublicClientConfig,ConfidentialClientConfig};
@@ -51,6 +59,13 @@ function start_device_authorization(
     return DeviceAuthorizationResponse(data; issued_at=issued_at)
 end
 
+"""
+    start_device_authorization(prm_url, config; issuer=nothing, http=HTTP, extra_params=Dict(), verbose=nothing)
+
+Runs full discovery before invoking [`start_device_authorization`](@ref).
+The returned named tuple includes the discovery metadata so you can pass it
+into [`poll_device_authorization_token`](@ref) later.
+"""
 function start_device_authorization(
     prm_url::AbstractString,
     config::Union{PublicClientConfig,ConfidentialClientConfig};
@@ -77,6 +92,12 @@ function start_device_authorization(
     )
 end
 
+"""
+    start_device_authorization_from_issuer(issuer_url, config; http=HTTP, extra_params=Dict(), verbose=nothing)
+
+Discovery helper for the case where you know the issuer but not the
+protected resource metadata.
+"""
 function start_device_authorization_from_issuer(
     issuer_url::AbstractString,
     config::Union{PublicClientConfig,ConfidentialClientConfig};
@@ -97,6 +118,14 @@ function start_device_authorization_from_issuer(
     return (device = device, authorization_server = discovery.authorization_server, discovery = discovery)
 end
 
+"""
+    poll_device_authorization_token(metadata, config, device; http=HTTP, extra_token_params=Dict(), verbose=nothing, sleep_function=sleep) -> TokenResponse
+
+Polls the token endpoint according to the server-specified interval until a
+token arrives or the user denies/lets the code expire.  Handles
+authorization_pending/slow_down responses automatically and persists
+refresh tokens for public clients.
+"""
 function poll_device_authorization_token(
     metadata::AuthorizationServerMetadata,
     config::Union{PublicClientConfig,ConfidentialClientConfig},

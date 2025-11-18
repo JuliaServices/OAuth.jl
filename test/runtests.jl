@@ -151,6 +151,53 @@ end
     @test response.extra["custom_field"] == 42
 end
 
+@testset "File-based refresh token store" begin
+    mktempdir() do dir
+        path = joinpath(dir, "refresh.json")
+        store = FileBasedRefreshTokenStore(path; permissions=nothing)
+        config = PublicClientConfig(client_id="desktop-app")
+        @test load_refresh_token(store, config) === nothing
+        save_refresh_token!(store, config, "refresh-123")
+        @test load_refresh_token(store, config) == "refresh-123"
+        doc = JSON.parse(read(path, String))
+        @test doc["version"] == 1
+        @test doc["encoding"] == "base64"
+        @test String(Base64.base64decode(String(doc["token"]))) == "refresh-123"
+        save_refresh_token!(store, config, "second-token")
+        @test load_refresh_token(store, config) == "second-token"
+        clear_refresh_token!(store, config)
+        @test !ispath(path)
+    end
+
+    mktempdir() do dir
+        nested = joinpath(dir, "tokens", "refresh.json")
+        store = FileBasedRefreshTokenStore(nested; permissions=nothing)
+        config = PublicClientConfig(client_id="nested-app")
+        save_refresh_token!(store, config, "nested-token")
+        @test isfile(nested)
+    end
+
+    mktempdir() do dir
+        path = joinpath(dir, "legacy-token")
+        open(path, "w") do io
+            write(io, "legacy\n")
+        end
+        store = FileBasedRefreshTokenStore(path; permissions=nothing)
+        config = PublicClientConfig(client_id="legacy-app")
+        @test load_refresh_token(store, config) == "legacy"
+    end
+
+    mktempdir() do dir
+        path = joinpath(dir, "refresh.json")
+        lock_path = joinpath(dir, "locks", "refresh.pid")
+        store = FileBasedRefreshTokenStore(path; permissions=nothing, lock_path=lock_path, stale_age=0)
+        config = PublicClientConfig(client_id="locked-app")
+        save_refresh_token!(store, config, "locked-token")
+        @test load_refresh_token(store, config) == "locked-token"
+        @test !ispath(lock_path)
+    end
+end
+
 @testset "WWW-Authenticate parsing" begin
     header = "Bearer realm=\"example\", error=\"invalid_token\", error_description=\"Token expired\""
     challenges = parse_www_authenticate(header)

@@ -51,6 +51,29 @@ function form_pairs(form::FormParams; sort_unique::Bool=true)
     return pairs
 end
 
+"""
+    LoopbackListener
+
+Represents the tiny HTTP server the PKCE helpers spin up on
+`http://127.0.0.1` so the system browser can post the authorization code
+back to your app.  The struct holds the running `HTTP.Server`, the async
+`Task` that drives it, a `Channel` where captured query parameters are
+delivered, plus the host/port/path that callers can present to an
+authorization server as their redirect URI.
+
+Most users never touch this type manually, but you can use it to build your
+own authorization UX if desired:
+
+```julia
+julia> listener = start_loopback_listener(\"127.0.0.1\", 5338, \"/oauth/callback\");
+
+julia> loopback_url(listener)
+\"http://127.0.0.1:5338/oauth/callback\"
+
+# Later, once you have received the redirect:
+julia> stop_loopback_listener(listener)
+```
+"""
 struct LoopbackListener
     server::HTTP.Server
     task::Task
@@ -64,8 +87,31 @@ loopback_url(listener::LoopbackListener) = "http://$(listener.host):$(listener.p
 
 Base.isopen(listener::LoopbackListener) = !istaskdone(listener.task)
 
+"""
+    DEFAULT_LOOPBACK_HOST
+
+Hostname we bind the temporary loopback HTTP server to.  Override it if you
+run inside a container or a network namespace where `127.0.0.1` is not the
+correct interface.
+"""
 const DEFAULT_LOOPBACK_HOST = "127.0.0.1"
+
+"""
+    DEFAULT_LOOPBACK_PORT
+
+The TCP port the loopback listener tries first.  When you need to run
+multiple concurrent PKCE sessions, increment this value or pass an explicit
+port to `start_pkce_authorization`.
+"""
 const DEFAULT_LOOPBACK_PORT = 5338
+
+"""
+    DEFAULT_LOOPBACK_PATH
+
+Path segment appended to the loopback host/port when constructing redirect
+URIs for PKCE helpers.  You rarely need to change this unless you already
+have an embedded server that handles a different callback path.
+"""
 const DEFAULT_LOOPBACK_PATH = "/oauth/callback"
 
 function normalize_headers(headers)
@@ -287,6 +333,24 @@ function start_loopback_listener(host::AbstractString, port::Integer, path::Abst
     return LoopbackListener(server, task, channel, String(host), Int(port), normalized_path)
 end
 
+"""
+    stop_loopback_listener(listener::LoopbackListener)
+
+Stops the temporary HTTP server created by `start_loopback_listener` and
+waits for its background task to finish.  Call this inside a `finally`
+block so you never leak a listening port—especially important when end
+users cancel halfway through authorization.
+
+# Examples
+```julia
+listener = start_loopback_listener(DEFAULT_LOOPBACK_HOST, DEFAULT_LOOPBACK_PORT, DEFAULT_LOOPBACK_PATH)
+try
+    # wait for OAuth redirect...
+finally
+    stop_loopback_listener(listener)
+end
+```
+"""
 function stop_loopback_listener(listener::LoopbackListener)
     try
         close(listener.server)

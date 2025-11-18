@@ -3,6 +3,12 @@
 
 const DEFAULT_PRM_PATH = "/.well-known/oauth-protected-resource"
 const DEFAULT_AS_METADATA_PATH = "/.well-known/oauth-authorization-server"
+"""
+    DEFAULT_JWKS_PATH
+
+Default URL path used when exposing a JWKS via [`register_jwks_endpoint!`](@ref)
+or [`public_jwk`](@ref).
+"""
 const DEFAULT_JWKS_PATH = "/.well-known/jwks.json"
 const DEFAULT_REALM = "protected"
 
@@ -172,6 +178,13 @@ const UNIX_EPOCH = DateTime(1970, 1, 1, 0, 0, 0)
 
 datetime_to_unix(dt::DateTime) = Dates.value(dt - UNIX_EPOCH) ÷ 1000
 
+"""
+    ProtectedResourceConfig
+
+Declarative description of a protected resource that you expose from your
+own server.  You can register it with [`register_protected_resource_metadata!`](@ref)
+to serve RFC 8414 metadata without manually building JSON.
+"""
 struct ProtectedResourceConfig
     resource::Union{String,Nothing}
     authorization_servers::Vector{String}
@@ -185,6 +198,12 @@ function ensure_metadata_url(value, field::AbstractString)
     return String(value)
 end
 
+"""
+    ProtectedResourceConfig(; resource=nothing, authorization_servers, scopes_supported=[], resource_documentation=nothing, resource_registration_endpoint=nothing, extra=nothing, path=DEFAULT_PRM_PATH)
+
+Validates URLs, normalizes string inputs, and builds a metadata document
+ready to publish.
+"""
 function ProtectedResourceConfig(; resource=nothing, authorization_servers, scopes_supported=String[], resource_documentation=nothing, resource_registration_endpoint=nothing, extra=nothing, path::AbstractString=DEFAULT_PRM_PATH)
     authz = normalize_string_vector(authorization_servers)
     isempty(authz) && throw(ArgumentError("authorization_servers must not be empty"))
@@ -204,12 +223,26 @@ end
 
 protected_resource_document(config::ProtectedResourceConfig) = copy(config.metadata)
 
+"""
+    register_protected_resource_metadata!(router, config; path=config.path) -> Function
+
+Registers an HTTP GET handler on the provided `router` that serves the JSON
+representation of `config`.  Returns the handler function so you can
+deregister it later if needed.
+"""
 function register_protected_resource_metadata!(router::HTTP.Router, config::ProtectedResourceConfig; path::AbstractString=config.path)
     handler = _ -> json_response(protected_resource_document(config))
     HTTP.register!(router, "GET", ensure_slash(path), handler)
     return handler
 end
 
+"""
+    AuthorizationServerConfig
+
+Server-side counterpart to [`AuthorizationServerMetadata`](@ref).  Populate
+the fields your authorization server supports and serve them through
+[`register_authorization_server_metadata!`](@ref).
+"""
 struct AuthorizationServerConfig
     issuer::String
     authorization_endpoint::Union{String,Nothing}
@@ -238,6 +271,12 @@ struct AuthorizationServerConfig
     path::String
 end
 
+"""
+    AuthorizationServerConfig(; issuer, authorization_endpoint=nothing, token_endpoint=nothing, ... , path=DEFAULT_AS_METADATA_PATH)
+
+Keyword constructor that enforces HTTPS on every endpoint URL and allows
+you to attach arbitrary extra metadata via `extra`.
+"""
 function AuthorizationServerConfig(; issuer, authorization_endpoint=nothing, token_endpoint=nothing, jwks_uri=nothing, device_authorization_endpoint=nothing, introspection_endpoint=nothing, revocation_endpoint=nothing, pushed_authorization_request_endpoint=nothing, backchannel_authentication_endpoint=nothing, end_session_endpoint=nothing, registration_endpoint=nothing, response_types_supported=String[], grant_types_supported=String[], code_challenge_methods_supported=String[], token_endpoint_auth_methods_supported=String[], token_endpoint_auth_signing_alg_values_supported=String[], scopes_supported=String[], request_object_signing_alg_values_supported=String[], request_parameter_supported=nothing, request_uri_parameter_supported=nothing, require_pushed_authorization_requests=nothing, mtls_endpoint_aliases=nothing, authorization_response_iss_parameter_supported=nothing, extra=nothing, path::AbstractString=DEFAULT_AS_METADATA_PATH)
     metadata = normalize_metadata_dict(extra)
     issuer_string = ensure_metadata_url(issuer, "AuthorizationServerConfig.issuer")
@@ -317,12 +356,24 @@ function AuthorizationServerConfig(; issuer, authorization_endpoint=nothing, tok
     )
 end
 
+"""
+    register_authorization_server_metadata!(router, config; path=config.path) -> Function
+
+Adds a GET endpoint to `router` that returns the authorization server
+metadata JSON derived from `config`.
+"""
 function register_authorization_server_metadata!(router::HTTP.Router, config::AuthorizationServerConfig; path::AbstractString=config.path)
     handler = _ -> json_response(config.metadata)
     HTTP.register!(router, "GET", ensure_slash(path), handler)
     return handler
 end
 
+"""
+    register_jwks_endpoint!(router, keys; path=DEFAULT_JWKS_PATH) -> Function
+
+Publishes a JSON Web Key Set generated from the objects in `keys`.  Each
+element can already be a dictionary or a struct with stringifiable fields.
+"""
 function register_jwks_endpoint!(router::HTTP.Router, keys; path::AbstractString=DEFAULT_JWKS_PATH)
     key_docs = Vector{Dict{String,Any}}()
     for key in keys
@@ -337,6 +388,13 @@ function register_jwks_endpoint!(router::HTTP.Router, keys; path::AbstractString
     return handler
 end
 
+"""
+    JWTAccessTokenIssuer
+
+Holds the signing material and metadata required to mint JWT access tokens
+for your resource server.  Combine with [`issue_access_token`](@ref) and
+[`public_jwk`](@ref) to build your own auth server in a few lines.
+"""
 mutable struct JWTAccessTokenIssuer
     issuer::String
     audience::Vector{String}
@@ -347,6 +405,12 @@ mutable struct JWTAccessTokenIssuer
     public_jwk::Union{Dict{String,Any},Nothing}
 end
 
+"""
+    JWTAccessTokenIssuer(; issuer, audience, private_key, alg=:RS256, kid=nothing, expires_in=3600, public_jwk=nothing)
+
+Loads the provided private key, deduces the right signer type, derives the
+public JWK (unless you supply one), and stores other helpful metadata.
+"""
 function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, expires_in::Integer=3600, public_jwk=nothing)
     alg_symbol = Symbol(uppercase(String(alg)))
     signer = if alg_symbol in SUPPORTED_RSA_ALGS
@@ -365,8 +429,21 @@ function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol
     return JWTAccessTokenIssuer(String(issuer), aud, signer, alg_symbol, kid_value, Int(expires_in), jwk_dict)
 end
 
+"""
+    AccessTokenStore
+
+Abstract storage backend for bearer tokens that you issue via the server
+helpers.  Implementors persist/retrieve arbitrary dictionaries keyed by a
+token string.
+"""
 abstract type AccessTokenStore end
 
+"""
+    IssuedAccessToken
+
+Internal record returned by [`issue_access_token`](@ref) that includes the
+serialized token plus the claims used to create it.
+"""
 struct IssuedAccessToken
     token::String
     claims::Dict{String,Any}
@@ -383,6 +460,14 @@ function token_audience(issuer::JWTAccessTokenIssuer, audience)
     return length(aud) == 1 ? aud[1] : aud
 end
 
+"""
+    issue_access_token(issuer; subject=nothing, client_id=nothing, scope=[], authorization_details=nothing, extra_claims=Dict(), audience=nothing, now=Dates.now(UTC), store=nothing, confirmation=nothing, confirmation_jkt=nothing) -> IssuedAccessToken
+
+Signs a JWT access token using the supplied [`JWTAccessTokenIssuer`](@ref)
+and optionally records it in an [`AccessTokenStore`](@ref) for later
+introspection or revocation checks.  Set `confirmation` / `confirmation_jkt`
+to embed DPoP confirmation claims.
+"""
 function issue_access_token(issuer::JWTAccessTokenIssuer; subject=nothing, client_id=nothing, scope=String[], authorization_details=nothing, extra_claims=Dict{String,Any}(), audience=nothing, now::DateTime=Dates.now(UTC), store::Union{Nothing,AccessTokenStore}=nothing, confirmation=nothing, confirmation_jkt=nothing)
     expires_at = now + Dates.Second(issuer.expires_in)
     claims = Dict{String,Any}(
@@ -429,6 +514,12 @@ function ensure_public_jwk!(issuer::JWTAccessTokenIssuer)
     return issuer.public_jwk
 end
 
+"""
+    public_jwk(issuer::JWTAccessTokenIssuer) -> Dict{String,Any}
+
+Returns (and memoizes) the public JWK derived from the issuer’s private key
+so you can publish it via [`register_jwks_endpoint!`](@ref).
+"""
 public_jwk(issuer::JWTAccessTokenIssuer) = ensure_public_jwk!(issuer)
 
 token_alg_string(alg::Symbol) = alg == :EDDSA ? "EdDSA" : String(alg)
@@ -484,12 +575,23 @@ mutable struct AccessTokenRecord
     confirmation_jkt::Union{String,Nothing}
 end
 
+"""
+    DPoPReplayCache
+
+Tracks recently seen DPoP JWT IDs so you can reject replays at the token
+endpoint or protected resource.  Thread-safe via a `ReentrantLock`.
+"""
 mutable struct DPoPReplayCache
     lock::ReentrantLock
     entries::Dict{String,DateTime}
     window::Dates.Second
 end
 
+"""
+    DPoPReplayCache(; window_seconds=300)
+
+Creates a replay cache that expires entries after `window_seconds`.
+"""
 function DPoPReplayCache(; window_seconds::Integer=300)
     window_seconds > 0 || throw(ArgumentError("window_seconds must be positive"))
     return DPoPReplayCache(ReentrantLock(), Dict{String,DateTime}(), Dates.Second(window_seconds))
@@ -518,6 +620,12 @@ function record_dpop_proof!(cache::DPoPReplayCache, jti::AbstractString, now::Da
     end
 end
 
+"""
+    InMemoryTokenStore()
+
+Simple dictionary-backed implementation of [`AccessTokenStore`](@ref).  Best
+suited for tests or single-process resource servers.
+"""
 mutable struct InMemoryTokenStore <: AccessTokenStore
     lock::ReentrantLock
     records::Dict{String,AccessTokenRecord}
@@ -525,6 +633,12 @@ end
 
 InMemoryTokenStore() = InMemoryTokenStore(ReentrantLock(), Dict{String,AccessTokenRecord}())
 
+"""
+    store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken)
+
+Persists an issued token into the backing store so later introspection or
+revocation checks can find it.
+"""
 function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToken)
     record = AccessTokenRecord(
         issued.token,
@@ -543,12 +657,24 @@ function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToke
     return record
 end
 
+"""
+    lookup_access_token(store::AccessTokenStore, token::AbstractString) -> Union{IssuedAccessToken,Nothing}
+
+Fetches a previously stored token record or returns `nothing` if the token
+is unknown (or revoked).
+"""
 function lookup_access_token(store::InMemoryTokenStore, token::AbstractString)
     lock(store.lock) do
         return get(store.records, String(token), nothing)
     end
 end
 
+"""
+    revoke_access_token!(store::AccessTokenStore, token::AbstractString)
+
+Removes a token from the store so future introspection attempts consider it
+invalid.
+"""
 function revoke_access_token!(store::InMemoryTokenStore, token::AbstractString)
     lock(store.lock) do
         record = get(store.records, String(token), nothing)
@@ -558,8 +684,19 @@ function revoke_access_token!(store::InMemoryTokenStore, token::AbstractString)
     end
 end
 
+"""
+    AuthorizationCodeStore
+
+Storage interface for authorization codes generated by the embedded AS.
+"""
 abstract type AuthorizationCodeStore end
 
+"""
+    AuthorizationCodeRecord
+
+Internal struct that captures everything needed to validate an
+authorization code (scope, PKCE challenge, expiration, etc.).
+"""
 struct AuthorizationCodeRecord
     code::String
     client_id::String
@@ -575,6 +712,7 @@ struct AuthorizationCodeRecord
     extra_claims::Dict{String,Any}
 end
 
+"""In-memory implementation of [`AuthorizationCodeStore`](@ref)."""
 mutable struct InMemoryAuthorizationCodeStore <: AuthorizationCodeStore
     lock::ReentrantLock
     records::Dict{String,AuthorizationCodeRecord}
@@ -582,6 +720,11 @@ end
 
 InMemoryAuthorizationCodeStore() = InMemoryAuthorizationCodeStore(ReentrantLock(), Dict{String,AuthorizationCodeRecord}())
 
+"""
+    store_authorization_code!(store::AuthorizationCodeStore, record)
+
+Persists an authorization code until it is redeemed or expires.
+"""
 function store_authorization_code!(store::InMemoryAuthorizationCodeStore, record::AuthorizationCodeRecord)
     lock(store.lock) do
         store.records[record.code] = record
@@ -589,12 +732,25 @@ function store_authorization_code!(store::InMemoryAuthorizationCodeStore, record
     return record
 end
 
+"""
+    consume_authorization_code!(store::AuthorizationCodeStore, code) -> Union{AuthorizationCodeRecord,Nothing}
+
+Atomically removes the specified code and returns its record so grant
+handlers can mint tokens.
+"""
 function consume_authorization_code!(store::InMemoryAuthorizationCodeStore, code::AbstractString)
     lock(store.lock) do
         return pop!(store.records, String(code), nothing)
     end
 end
 
+"""
+    AuthorizationRequestContext
+
+Data passed to your `consent_handler` inside `build_authorization_endpoint`.
+Contains the client’s requested redirect URI, scope, PKCE challenge, and
+raw request params.
+"""
 Base.@kwdef struct AuthorizationRequestContext
     client_id::String
     redirect_uri::String
@@ -608,6 +764,12 @@ Base.@kwdef struct AuthorizationRequestContext
     params::Dict{String,String}
 end
 
+"""
+    AuthorizationGrantDecision
+
+Return value from your consent handler that indicates whether the user
+granted the request and which scopes/resources were approved.
+"""
 Base.@kwdef struct AuthorizationGrantDecision
     approved::Bool = true
     subject::Union{String,Nothing} = nothing
@@ -620,6 +782,11 @@ Base.@kwdef struct AuthorizationGrantDecision
     error_description::Union{String,Nothing} = nothing
 end
 
+"""
+    grant_authorization(subject; scope=String[], resource=String[], authorization_details=nothing, extra_params=Dict(), extra_claims=Dict()) -> AuthorizationGrantDecision
+
+Helper to build the affirmative variant of [`AuthorizationGrantDecision`](@ref).
+"""
 function grant_authorization(subject::Union{String,Nothing}; scope=String[], resource=String[], authorization_details=nothing, extra_params=Dict{String,String}(), extra_claims=Dict{String,Any}())
     return AuthorizationGrantDecision(
         approved = true,
@@ -632,6 +799,11 @@ function grant_authorization(subject::Union{String,Nothing}; scope=String[], res
     )
 end
 
+"""
+    deny_authorization(; error=\"access_denied\", description=nothing) -> AuthorizationGrantDecision
+
+Convenience constructor for negative decisions with an OAuth error payload.
+"""
 function deny_authorization(; error::AbstractString="access_denied", description=nothing)
     return AuthorizationGrantDecision(
         approved = false,
@@ -640,6 +812,12 @@ function deny_authorization(; error::AbstractString="access_denied", description
     )
 end
 
+"""
+    AuthorizationEndpointConfig
+
+Aggregates everything the built-in authorization endpoint needs: a store,
+redirect URI resolver, consent handler, and code TTL.
+"""
 struct AuthorizationEndpointConfig{S<:AuthorizationCodeStore,R<:Function,C<:Function}
     code_store::S
     redirect_uri_resolver::R
@@ -647,6 +825,12 @@ struct AuthorizationEndpointConfig{S<:AuthorizationCodeStore,R<:Function,C<:Func
     code_ttl::Dates.Second
 end
 
+"""
+    AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds=600)
+
+Validates inputs and returns a ready-to-use configuration for
+[`build_authorization_endpoint`](@ref).
+"""
 function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds::Integer=600)
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
     redirect_uri_resolver isa Function || throw(ArgumentError("redirect_uri_resolver must be callable"))
@@ -655,13 +839,27 @@ function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consen
     return AuthorizationEndpointConfig(code_store, redirect_uri_resolver, consent_handler, Dates.Second(code_ttl_seconds))
 end
 
+"""
+    TokenEndpointClient
+
+Represents the authenticated client hitting your token endpoint.  Contains
+its `client_id` and whether it’s a public client.
+"""
 struct TokenEndpointClient
     client_id::String
     public::Bool
 end
 
+"""Normalizes inputs before building a `TokenEndpointClient`."""
 TokenEndpointClient(client_id::AbstractString; public::Bool=false) = TokenEndpointClient(String(client_id), Bool(public))
 
+"""
+    TokenEndpointConfig
+
+Holds everything the built-in token endpoint needs: the authorization code
+store, token issuer, client authenticator, refresh token generator, extra
+claims callback, optional persistent token store, and allowed grant types.
+"""
 struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:Function}
     code_store::S
     token_issuer::JWTAccessTokenIssuer
@@ -672,6 +870,12 @@ struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:
     allowed_grant_types::Set{String}
 end
 
+"""
+    TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=[\"authorization_code\"])
+
+Validates and normalizes the callbacks before handing the struct to
+[`build_token_endpoint`](@ref).
+"""
 function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"])
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
     token_issuer isa JWTAccessTokenIssuer || throw(ArgumentError("token_issuer must be a JWTAccessTokenIssuer"))
@@ -683,6 +887,14 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed)
 end
 
+"""
+    client_credentials_authenticator(credentials; allow_public=false) -> Function
+
+Builds a helper that authenticates token endpoint requests using a lookup
+table of `client_id => client_secret`.  When `allow_public=true` the
+authenticator accepts clients that omit credentials, which is useful when
+you support both public and confidential apps on the same endpoint.
+"""
 function client_credentials_authenticator(credentials; allow_public::Bool=false)
     normalized = Dict{String,String}()
     for (k, v) in credentials
@@ -755,6 +967,13 @@ function parse_authorization_details(raw_value, redirect_uri, state)
     end
 end
 
+"""
+    build_authorization_endpoint(config::AuthorizationEndpointConfig) -> Function
+
+Returns an HTTP handler that implements the OAuth 2.0 authorization
+endpoint.  The handler enforces PKCE, calls your consent callback, and
+stores issued codes in the configured store.
+"""
 function build_authorization_endpoint(config::AuthorizationEndpointConfig)
     function handler(req::HTTP.Request)
         method = HTTP.method(req)
@@ -946,6 +1165,13 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     return HTTP.Response(200, headers, JSON.json(response))
 end
 
+"""
+    build_token_endpoint(config::TokenEndpointConfig) -> Function
+
+Creates a handler that implements the OAuth 2.0 token endpoint for the
+authorization_code grant.  It verifies client credentials, enforces PKCE,
+issues JWT access tokens, and optionally persists refresh tokens.
+"""
 function build_token_endpoint(config::TokenEndpointConfig)
     function handler(req::HTTP.Request)
         HTTP.method(req) == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
@@ -966,13 +1192,38 @@ function build_token_endpoint(config::TokenEndpointConfig)
     return handler
 end
 
+"""
+    EndpointAuthenticator
+
+Abstract interface for authenticating callers of management endpoints
+(`introspection`, `revocation`, etc.).
+"""
 abstract type EndpointAuthenticator end
+
+"""
+    AllowAllAuthenticator()
+
+Sentinel authenticator that accepts every request.
+"""
 struct AllowAllAuthenticator <: EndpointAuthenticator end
+
+"""
+    BasicCredentialsAuthenticator(; credentials, realm=\"oauth2\")
+
+Validates HTTP Basic credentials for management endpoints.  Pass a
+`Dict(\"client\" => \"secret\")` style table for quick setups.
+"""
 struct BasicCredentialsAuthenticator <: EndpointAuthenticator
     realm::String
     credentials::Dict{String,String}
 end
 
+"""
+    BasicCredentialsAuthenticator(; credentials, realm=\"oauth2\")
+
+Normalizes the provided credential table into strings and returns a
+`BasicCredentialsAuthenticator`.
+"""
 function BasicCredentialsAuthenticator(; credentials, realm::AbstractString="oauth2")
     isempty(credentials) && throw(ArgumentError("credentials must not be empty"))
     dict = Dict{String,String}()
@@ -1026,6 +1277,13 @@ function VerificationKey(; kid=nothing, alg=nothing, use=nothing, kty, verifier)
     return VerificationKey(kid_val, alg_val, use_val, String(kty), verifier)
 end
 
+"""
+    TokenValidationConfig
+
+Holds the knobs for JWT access token validation: a set of trusted issuers,
+expected audience, acceptable algorithms, leeway, DPoP replay cache, etc.
+Feed it to [`validate_jwt_access_token`](@ref).
+"""
 struct TokenValidationConfig
     issuer::String
     audience::Vector{String}
@@ -1034,6 +1292,12 @@ struct TokenValidationConfig
     keys::Vector{VerificationKey}
 end
 
+"""
+    AccessTokenClaims
+
+Result of [`validate_jwt_access_token`](@ref).  Exposes common claims such
+as `sub`, `aud`, `scope`, and DPoP confirmation digest.
+"""
 struct AccessTokenClaims
     token::String
     subject::Union{String,Nothing}
@@ -1184,6 +1448,13 @@ function parse_numeric_claim(value)
     end
 end
 
+"""
+    validate_jwt_access_token(token, config; now=Dates.now(UTC), required_scopes=String[]) -> AccessTokenClaims
+
+Checks signature, issuer, audience, expiration, scope, DPoP confirmation,
+and optional replay cache entries for a JWT access token that your server
+received.  Throws `OAuthError` if validation fails.
+"""
 function validate_jwt_access_token(token::AbstractString, config::TokenValidationConfig; now::DateTime=Dates.now(UTC), required_scopes=String[])
     header, payload, signature, signing_input = decode_compact_jwt(token)
     alg_value = haskey(header, "alg") ? uppercase(String(header["alg"])) : error(OAuthError(:invalid_token, "Missing alg"))
@@ -1365,6 +1636,13 @@ function verify_dpop_proof(
     record_dpop_proof!(replay_cache, String(jti), now) || throw(OAuthError(:invalid_token, "DPoP proof replay detected"))
 end
 
+"""
+    build_www_authenticate_header(resource_metadata_url; realm=nothing, required_scopes=String[], error_code=nothing, error_description=nothing) -> String
+
+Constructs a standards-compliant `WWW-Authenticate` header for Protected
+Resource Metadata-based deployments.  Useful when returning 401s from your
+resource server.
+"""
 function build_www_authenticate_header(resource_metadata_url; realm::Union{String,Nothing}=nothing, required_scopes=String[], error_code::Union{String,Nothing}=nothing, error_description::Union{String,Nothing}=nothing)
     parts = ["Bearer"]
     realm_value = quote_auth_value(realm === nothing ? DEFAULT_REALM : realm)
@@ -1381,6 +1659,13 @@ function unauthorized_response(resource_metadata_url; realm=nothing, required_sc
     return HTTP.Response(status, HTTP.Headers(["WWW-Authenticate" => header]), "")
 end
 
+"""
+    protected_resource_middleware(; token_store=nothing, token_validator=nothing, realm=DEFAULT_REALM, extra_challenges=String[])
+
+Builds an HTTP middleware function that validates incoming `Authorization`
+headers, enforces scope requirements, and passes the resulting
+[`AccessTokenClaims`](@ref) to your handler via the request context.
+"""
 function protected_resource_middleware(
     handler::Function,
     validator::TokenValidationConfig;
@@ -1458,6 +1743,13 @@ function protected_resource_middleware(
     return middleware
 end
 
+"""
+    build_introspection_handler(store; authenticator=AllowAllAuthenticator()) -> Function
+
+Produces an HTTP handler that implements RFC 7662 token introspection by
+looking up tokens in the provided `store`.  Requests are authenticated via
+the supplied `EndpointAuthenticator`.
+"""
 function build_introspection_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
@@ -1496,6 +1788,13 @@ function build_introspection_handler(store::InMemoryTokenStore; authenticator::E
     return handler
 end
 
+"""
+    build_revocation_handler(store; authenticator=AllowAllAuthenticator()) -> Function
+
+Builds an RFC 7009 token revocation endpoint backed by the supplied token
+store.  Deletes matching access tokens and returns the appropriate HTTP
+response envelope.
+"""
 function build_revocation_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)

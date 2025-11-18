@@ -9,6 +9,13 @@ const ED25519_SECRET_KEY_BYTES = 64
 const ED25519_SIGNATURE_BYTES = 64
 const ED25519_SEED_BYTES = 32
 
+"""
+    JWTSigner
+
+Internal marker type for things that can sign JSON Web Tokens (RSA, EC, or
+EdDSA).  End users usually interact with these via higher-level helpers
+such as [`RequestObjectSigner`](@ref).
+"""
 abstract type JWTSigner end
 
 mutable struct RSAKeyHandle
@@ -41,31 +48,58 @@ mutable struct ECCKeyHandle
     end
 end
 
+"""
+    RSASigner
+
+Wraps an AWS-LC RSA key handle and knows which algorithms it supports.
+Construct instances via [`rsa_signer_from_bytes`](@ref).
+"""
 struct RSASigner <: JWTSigner
     key::RSAKeyHandle
 end
 
+"""
+    ECSigner
+
+Encapsulates an EC key loaded from PEM/DER bytes together with the curve
+(`:P256` or `:P384`).  Build via [`ecc_signer_from_bytes`](@ref).
+"""
 struct ECSigner <: JWTSigner
     key::ECCKeyHandle
     curve::Symbol        # :P256 or :P384
 end
 
+"""
+    EdDSASigner
+
+Stores raw Ed25519 secret/public key material for signing with libsodium.
+Construct with [`eddsa_signer_from_bytes`](@ref).
+"""
 struct EdDSASigner <: JWTSigner
     secret::Vector{UInt8}
     public::Vector{UInt8}
 end
 
+"""
+    JWTVerifier
+
+Marker type for verification handles that correspond to `JWTSigner`
+counterparts.
+"""
 abstract type JWTVerifier end
 
+"""Verifier for RSA JWTs created via [`rsa_verifier_from_der`](@ref)."""
 struct RSAVerifier <: JWTVerifier
     key::RSAKeyHandle
 end
 
+"""Verifier for `ES256`/`ES384` signatures built from public coordinates."""
 struct ECVerifier <: JWTVerifier
     key::ECCKeyHandle
     curve::Symbol
 end
 
+"""Verifier for `EdDSA` signatures built from a raw 32-byte public key."""
 struct EdDSAVerifier <: JWTVerifier
     public::Vector{UInt8}
 end
@@ -155,6 +189,13 @@ function ed25519_public_from_secret(secret::Vector{UInt8})
     return public
 end
 
+"""
+    rsa_signer_from_bytes(data) -> RSASigner
+
+Accepts DER or PEM-encoded PKCS#8/PKCS#1 private keys and returns an
+`RSASigner`.  The helper tries PKCS#8 first, then PKCS#1, and throws a
+helpful error if parsing fails.
+"""
 function rsa_signer_from_bytes(raw)
     bytes = normalize_key_bytes(raw)
     alloc = default_aws_allocator()
@@ -170,6 +211,12 @@ function rsa_signer_from_bytes(raw)
     return RSASigner(RSAKeyHandle(key_ptr))
 end
 
+"""
+    ecc_signer_from_bytes(data, curve::Symbol) -> ECSigner
+
+Loads an EC private key for the provided curve (`:P256` or `:P384`) and
+returns an `ECSigner` ready for JWT signing.
+"""
 function ecc_signer_from_bytes(raw, curve::Symbol)
     bytes = normalize_key_bytes(raw)
     alloc = default_aws_allocator()
@@ -189,6 +236,12 @@ function ecc_signer_from_bytes(raw, curve::Symbol)
     return ECSigner(ECCKeyHandle(key_ptr), curve)
 end
 
+"""
+    eddsa_signer_from_bytes(data) -> EdDSASigner
+
+Accepts either a 64-byte Ed25519 private key or a 32-byte seed and returns
+an `EdDSASigner`.
+"""
 function eddsa_signer_from_bytes(raw)
     bytes = normalize_key_bytes(raw)
     if length(bytes) == ED25519_SECRET_KEY_BYTES
@@ -513,6 +566,12 @@ function decode_compact_jwt(token::AbstractString)
     return header, payload, signature, signing_input
 end
 
+"""
+    eddsa_verifier_from_bytes(data) -> EdDSAVerifier
+
+Normalizes any vector-like input to a 32-byte Ed25519 public key and
+returns an `EdDSAVerifier`.
+"""
 function eddsa_verifier_from_bytes(raw)
     ensure_sodium_initialized()
     bytes = Vector{UInt8}(raw)
@@ -520,6 +579,12 @@ function eddsa_verifier_from_bytes(raw)
     return EdDSAVerifier(bytes)
 end
 
+"""
+    rsa_verifier_from_der(der_bytes) -> RSAVerifier
+
+Creates an RSA verification handle from DER-encoded PKCS#1 public key
+bytes.
+"""
 function rsa_verifier_from_der(der::Vector{UInt8})
     alloc = default_aws_allocator()
     key_ptr = Ptr{aws_rsa_key_pair}(C_NULL)
@@ -531,11 +596,23 @@ function rsa_verifier_from_der(der::Vector{UInt8})
     return RSAVerifier(RSAKeyHandle(key_ptr))
 end
 
+"""
+    rsa_verifier_from_components(modulus, exponent) -> RSAVerifier
+
+Convenience helper that builds the DER structure for you when you already
+have big-endian modulus/exponent values.
+"""
 function rsa_verifier_from_components(modulus::Vector{UInt8}, exponent::Vector{UInt8})
     der = encode_der_sequence([encode_der_integer(modulus), encode_der_integer(exponent)])
     return rsa_verifier_from_der(der)
 end
 
+"""
+    ecc_public_coordinates(signer::ECSigner) -> (x::Vector{UInt8}, y::Vector{UInt8})
+
+Extracts the affine coordinates for the signer’s public key so you can
+publish a JWK or construct a verifier.
+"""
 function ecc_public_coordinates(signer::ECSigner)
     x_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
     y_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
@@ -546,6 +623,11 @@ function ecc_public_coordinates(signer::ECSigner)
     return copy(x_bytes), copy(y_bytes)
 end
 
+"""
+    ecc_verifier_from_coordinates(x, y, curve) -> ECVerifier
+
+Builds an `ECVerifier` from the raw affine coordinates of a public key.
+"""
 function ecc_verifier_from_coordinates(x::Vector{UInt8}, y::Vector{UInt8}, curve::Symbol)
     alloc = default_aws_allocator()
     curve_id = curve == :P256 ? AWS_CAL_ECDSA_P256 :

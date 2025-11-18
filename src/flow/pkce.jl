@@ -1,3 +1,24 @@
+"""
+    start_pkce_authorization(prm_url, config; kwargs...) -> AuthorizationSession
+
+Discovers metadata for the protected resource at `prm_url`, spins up (if
+requested) a loopback HTTP listener, generates PKCE state/verifier values,
+and optionally opens the user’s browser.  Returns an [`AuthorizationSession`](@ref)
+that you can feed to [`wait_for_authorization_code`](@ref) or
+[`finalize_pkce_session`](@ref).
+
+# Examples
+```julia
+session = start_pkce_authorization(
+    \"https://api.example/.well-known/oauth-resource\",
+    PublicClientConfig(client_id = \"my-cli\"),
+    open_browser = false,
+    listener_port = 8888,
+)
+
+println(\"Open this URL: \", session.authorization_url)
+```
+"""
 function start_pkce_authorization(
     prm_url::AbstractString,
     config::PublicClientConfig;
@@ -39,6 +60,13 @@ function start_pkce_authorization(
     )
 end
 
+"""
+    start_pkce_authorization_from_issuer(issuer_url, config; kwargs...) -> AuthorizationSession
+
+Convenience wrapper when you already know the issuer URL and do not need to
+look up protected resource metadata.  Otherwise identical to
+[`start_pkce_authorization`](@ref).
+"""
 function start_pkce_authorization_from_issuer(
     issuer_url::AbstractString,
     config::PublicClientConfig;
@@ -234,6 +262,14 @@ function prepare_pkce_session(
     end
 end
 
+"""
+    exchange_code_for_token(metadata, config, code, verifier; http=HTTP, extra_params=Dict(), verbose=nothing) -> TokenResponse
+
+Swaps the authorization `code` returned by the browser step for tokens at
+the discovered token endpoint.  Handles DPoP proof attachment, saves new
+refresh tokens automatically, and surfaces HTTP/JSON problems as
+`OAuthError`s.
+"""
 function exchange_code_for_token(metadata::AuthorizationServerMetadata, config::PublicClientConfig, code::AbstractString, verifier::PKCEVerifier; http=HTTP, extra_params=Dict{String,String}(), verbose::Union{Bool,Nothing}=nothing)
     verbose = effective_verbose(config, verbose)
     metadata.token_endpoint === nothing && throw(OAuthError(:metadata_error, "Token endpoint missing in issuer metadata"))
@@ -276,6 +312,18 @@ function exchange_code_for_token(metadata::AuthorizationServerMetadata, config::
     return token
 end
 
+"""
+    refresh_pkce_token(source, config; refresh_token=nothing, http=HTTP, extra_token_params=Dict(), verbose=nothing)
+
+Refreshes an access token using the stored refresh token.  `source` can be:
+
+1. `AuthorizationServerMetadata` — you already have issuer metadata.
+2. Protected resource URL (`String`) — discovery runs again.
+3. Named tuple returned by `complete_pkce_authorization` — we reuse the session metadata.
+
+When `refresh_token` is omitted we fall back to whatever the configured
+`RefreshTokenStore` persisted earlier.
+"""
 function refresh_pkce_token(
     metadata::AuthorizationServerMetadata,
     config::PublicClientConfig;
@@ -342,6 +390,13 @@ function refresh_pkce_token(
     return token
 end
 
+"""
+    refresh_pkce_token_from_issuer(issuer_url, config; kwargs...)
+
+Shortcut when you already know the issuer.  Returns a named tuple that
+includes the refreshed [`TokenResponse`](@ref) and the metadata used, so
+you can keep calling `refresh_pkce_token` with the resulting session later.
+"""
 function refresh_pkce_token_from_issuer(
     issuer_url::AbstractString,
     config::PublicClientConfig;
@@ -414,6 +469,14 @@ function refresh_pkce_token(
     )
 end
 
+"""
+    wait_for_authorization_code(session; timeout=120) -> NamedTuple
+
+Blocks until the loopback listener created in `start_pkce_authorization`
+receives the browser redirect.  Validates the returned state parameter,
+raises `OAuthError` when the IdP returned an error, and yields a
+`(code, state, params)` named tuple upon success.
+"""
 function wait_for_authorization_code(session::AuthorizationSession; timeout::Real=120)
     listener = session.listener
     listener === nothing && throw(OAuthError(:listener_missing, "No loopback listener available for this session"))
@@ -437,6 +500,15 @@ function wait_for_authorization_code(session::AuthorizationSession; timeout::Rea
     return (code = String(code), state = String(resp_state), params = params)
 end
 
+"""
+    complete_pkce_authorization(prm_url, config; kwargs...) -> NamedTuple
+
+High-level helper that runs the entire PKCE flow end-to-end: discovery,
+loopback listener, browser launch, waiting for the authorization code, and
+token exchange.  Returns a named tuple with the `token`, session metadata,
+the raw callback parameters, and discovery context so you can reuse it
+later (e.g., refresh).
+"""
 function complete_pkce_authorization(
     prm_url::AbstractString,
     config::PublicClientConfig;
@@ -485,6 +557,12 @@ function complete_pkce_authorization(
     )
 end
 
+"""
+    complete_pkce_authorization_from_issuer(issuer_url, config; kwargs...) -> NamedTuple
+
+Same as [`complete_pkce_authorization`](@ref), but skips the protected
+resource metadata lookup.
+"""
 function complete_pkce_authorization_from_issuer(
     issuer_url::AbstractString,
     config::PublicClientConfig;

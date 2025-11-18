@@ -1,5 +1,14 @@
  
 
+"""
+    request_client_credentials_token(metadata, config; http=HTTP, extra_token_params=Dict(), verbose=nothing, resource_metadata=nothing) -> TokenResponse
+
+Performs the `client_credentials` token exchange against the provided
+authorization server metadata.  The helper validates that the server
+supports the grant, attaches whatever token endpoint authentication is
+configured for the confidential client, and returns a parsed
+[`TokenResponse`](@ref).
+"""
 function request_client_credentials_token(
     metadata::AuthorizationServerMetadata,
     config::ConfidentialClientConfig;
@@ -56,6 +65,13 @@ function request_client_credentials_token(
     return TokenResponse(data; issued_at=issued_at, dpop_nonce=nonce_value)
 end
 
+"""
+    request_client_credentials_token_from_issuer(issuer_url, config; kwargs...) -> NamedTuple
+
+Runs issuer discovery before calling
+[`request_client_credentials_token`](@ref).  The returned named tuple
+contains both the token and the metadata used to obtain it.
+"""
 function request_client_credentials_token_from_issuer(
     issuer_url::AbstractString,
     config::ConfidentialClientConfig;
@@ -76,6 +92,12 @@ function request_client_credentials_token_from_issuer(
     return (token = token, authorization_server = discovery.authorization_server, discovery = discovery)
 end
 
+"""
+    request_client_credentials_token(prm_url, config; issuer=nothing, kwargs...) -> NamedTuple
+
+Discovery helper that starts from a protected resource metadata URL,
+identifies the proper issuer, and then fetches a client credentials token.
+"""
 function request_client_credentials_token(
     prm_url::AbstractString,
     config::ConfidentialClientConfig;
@@ -102,6 +124,14 @@ function request_client_credentials_token(
     )
 end
 
+"""
+    register_dynamic_client(metadata, client_metadata; http=HTTP, initial_access_token=nothing, verbose=false) -> JSONObject
+
+Calls the Dynamic Client Registration endpoint declared in issuer metadata
+and returns the resulting JSON document (which typically holds
+`client_secret`, `registration_access_token`, etc.).  Pass
+`initial_access_token` when the AS protects its registration endpoint.
+"""
 function register_dynamic_client(
     metadata::AuthorizationServerMetadata,
     client_metadata;
@@ -129,6 +159,13 @@ function register_dynamic_client(
     return JSONObject(data)
 end
 
+"""
+    register_dynamic_client_from_issuer(issuer_url, client_metadata; kwargs...) -> NamedTuple
+
+Fetches metadata for the issuer and forwards the request to
+[`register_dynamic_client`](@ref).  Returns both the JSON response and the
+metadata used.
+"""
 function register_dynamic_client_from_issuer(
     issuer_url::AbstractString,
     client_metadata;
@@ -147,6 +184,13 @@ function register_dynamic_client_from_issuer(
     return (client = client, authorization_server = metadata)
 end
 
+"""
+    update_dynamic_client(configuration_endpoint; http=HTTP, client_metadata, registration_access_token, verbose=false) -> JSONObject
+
+Issues a PUT request to the client configuration endpoint with the supplied
+metadata body.  Requires the `registration_access_token` obtained during
+registration.
+"""
 function update_dynamic_client(
     configuration_endpoint::AbstractString,
     client_metadata;
@@ -171,6 +215,12 @@ function update_dynamic_client(
     return JSONObject(data)
 end
 
+"""
+    delete_dynamic_client(configuration_endpoint; http=HTTP, registration_access_token, verbose=false) -> Bool
+
+Sends a DELETE to the client configuration endpoint, authenticating with
+the provided `registration_access_token`.  Returns `true` on HTTP 2xx.
+"""
 function delete_dynamic_client(
     configuration_endpoint::AbstractString;
     http=HTTP,
