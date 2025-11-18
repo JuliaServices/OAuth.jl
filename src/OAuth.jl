@@ -2,6 +2,9 @@ module OAuth
 
 using Dates, HTTP, JSON, Random, SHA, Base64, LibAwsCal, LibAwsCommon
 
+const DEFAULT_RESPONSE_TYPE = "code"
+const MAX_DPOP_NONCE_RETRIES = 1
+
 include("errors.jl")
 include("util.jl")
 include("jwt_util.jl")
@@ -10,7 +13,11 @@ include("wwwauthenticate.jl")
 include("discovery.jl")
 include("pkce.jl")
 include("browser.jl")
-include("flow.jl")
+include("flow/common.jl")
+include("flow/pkce.jl")
+include("flow/device.jl")
+include("flow/client.jl")
+include("flow/dpop.jl")
 include("server.jl")
 
 export OAuthError

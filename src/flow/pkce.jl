@@ -391,6 +391,29 @@ function refresh_pkce_token(
     )
 end
 
+function refresh_pkce_token(
+    result::NamedTuple;
+    http=HTTP,
+    extra_token_params=Dict{String,String}(),
+    verbose::Union{Bool,Nothing}=nothing,
+)
+    haskey(result, :session) || throw(ArgumentError("result must have a :session field (from complete_pkce_authorization)"))
+    session = result.session
+    refreshed_token = refresh_pkce_token(
+        session.authorization_server,
+        session.client_config;
+        http=http,
+        extra_token_params=extra_token_params,
+        verbose=verbose,
+    )
+    return (
+        token = refreshed_token,
+        session = session,
+        callback = result.callback,
+        discovery = result.discovery,
+    )
+end
+
 function wait_for_authorization_code(session::AuthorizationSession; timeout::Real=120)
     listener = session.listener
     listener === nothing && throw(OAuthError(:listener_missing, "No loopback listener available for this session"))

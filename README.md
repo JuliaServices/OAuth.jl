@@ -79,6 +79,14 @@ client = PublicClientConfig(
     use_par = true,
     request_object_signer = request_signer,
 )
+
+# Now use the client config to start an authorization flow:
+result = complete_pkce_authorization(
+    "https://api.example/.well-known/oauth-protected-resource",
+    client;
+    open_browser = true,
+)
+access_token = result.token
 ```
 
 Confidential clients are configured the same way but add token-endpoint credentials:
@@ -95,6 +103,14 @@ service_app = ConfidentialClientConfig(
     scopes = ["jobs.write"],
     resources = ["https://api.example"],
     authorization_details = nothing,
+)
+
+# Use the confidential client config to request a service-to-service token:
+discovery = discover_oauth_metadata_from_issuer("https://id.example")
+token = request_client_credentials_token(
+    discovery.authorization_server,
+    service_app;
+    extra_token_params = Dict("resource" => "https://api.example/processor"),
 )
 ```
 
@@ -121,9 +137,17 @@ token = exchange_code_for_token(
 )
 ```
 
-The convenience wrapper `complete_pkce_authorization` combines the start/wait/exchange phases if you’re happy letting OAuth.jl open a browser window:
+The convenience wrapper `complete_pkce_authorization` combines the start/wait/exchange phases if you're happy letting OAuth.jl open a browser window:
 
 ```julia
+# Configure a refresh token store to persist tokens across sessions
+client = PublicClientConfig(
+    client_id = "desktop-app",
+    redirect_uri = "http://127.0.0.1:8765/callback",
+    scopes = ["openid", "profile", "payments.read"],
+    refresh_token_store = InMemoryRefreshTokenStore(),  # or use CallbackRefreshTokenStore for custom persistence
+)
+
 result = complete_pkce_authorization(
     "https://api.example/.well-known/oauth-protected-resource",
     client;
@@ -133,10 +157,19 @@ result = complete_pkce_authorization(
 access_token = result.token
 ```
 
-Refresh tokens are persisted via the configured `RefreshTokenStore`, and the helpers automatically carry over `resource` and `authorization_details` to refresh requests:
+Refresh tokens are persisted via the configured `RefreshTokenStore`, and the helpers automatically carry over `resource` and `authorization_details` to refresh requests. The simplest way is to pass the result directly:
 
 ```julia
-refreshed = refresh_pkce_token(result.session.authorization_server, result.session.client_config)
+refreshed_result = refresh_pkce_token(result)
+# refreshed_result.token is the new TokenResponse with the refreshed access token
+# refreshed_result.session, refreshed_result.callback, and refreshed_result.discovery are unchanged
+```
+
+You can also call the lower-level method directly, which returns just the `TokenResponse`:
+
+```julia
+refreshed_token = refresh_pkce_token(result.session.authorization_server, result.session.client_config)
+# refreshed_token is a TokenResponse containing the new access token
 ```
 
 ### Device Authorization Flow

@@ -740,7 +740,7 @@ function build_client_assertion(
     return build_hmac_jws_compact(header, payload, auth.secret, auth.alg)
 end
 
-normalize_dpop_url(url::AbstractString) = begin
+function normalize_dpop_url(url::AbstractString)
     uri = HTTP.URI(String(url))
     scheme = lowercase(String(uri.scheme))
     host = uri.host === nothing ? "" : String(uri.host)
@@ -769,7 +769,7 @@ normalize_dpop_url(url::AbstractString) = begin
     end
 end
 
-is_default_port(scheme::AbstractString, port) = begin
+function is_default_port(scheme::AbstractString, port)
     if scheme == "https"
         return port == 443
     elseif scheme == "http"

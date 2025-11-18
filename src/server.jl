@@ -965,6 +965,7 @@ function build_token_endpoint(config::TokenEndpointConfig)
     end
     return handler
 end
+
 abstract type EndpointAuthenticator end
 struct AllowAllAuthenticator <: EndpointAuthenticator end
 struct BasicCredentialsAuthenticator <: EndpointAuthenticator
@@ -1363,6 +1364,7 @@ function verify_dpop_proof(
     jti isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing jti"))
     record_dpop_proof!(replay_cache, String(jti), now) || throw(OAuthError(:invalid_token, "DPoP proof replay detected"))
 end
+
 function build_www_authenticate_header(resource_metadata_url; realm::Union{String,Nothing}=nothing, required_scopes=String[], error_code::Union{String,Nothing}=nothing, error_description::Union{String,Nothing}=nothing)
     parts = ["Bearer"]
     realm_value = quote_auth_value(realm === nothing ? DEFAULT_REALM : realm)
