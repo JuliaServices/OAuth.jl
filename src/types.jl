@@ -49,7 +49,7 @@ end
 const DEFAULT_REFRESH_TOKEN_LOCK_STALE_AGE = 30.0
 
 """
-    FileBasedRefreshTokenStore(path; permissions=0o600, lock_path="$path.lock", stale_age=30)
+    FileBasedRefreshTokenStore(path; permissions=0o600, lock_path="\$path.lock", stale_age=30)
 
 Helper constructor that normalizes user paths, lock file locations, and
 permission bits for `FileBasedRefreshTokenStore`.  The defaults mirror the
