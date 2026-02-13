@@ -190,6 +190,25 @@ function ed25519_public_from_secret(secret::Vector{UInt8})
 end
 
 """
+    generate_ed25519_keypair(; rng=RandomDevice()) -> (secret::Vector{UInt8}, public::Vector{UInt8})
+
+Generates a new Ed25519 keypair suitable for JWT signing. Returns a 64-byte secret
+key and a 32-byte public key. The secret key can be used directly with
+[`eddsa_signer_from_bytes`](@ref) or [`JWTAccessTokenIssuer`](@ref).
+
+# Examples
+```julia
+secret, public = generate_ed25519_keypair()
+signer = eddsa_signer_from_bytes(secret)
+```
+"""
+function generate_ed25519_keypair(; rng=Random.RandomDevice())
+    ensure_sodium_initialized()
+    seed = rand(rng, UInt8, ED25519_SEED_BYTES)
+    return ed25519_seed_keypair(seed)
+end
+
+"""
     rsa_signer_from_bytes(data) -> RSASigner
 
 Accepts DER or PEM-encoded PKCS#8/PKCS#1 private keys and returns an
@@ -680,5 +699,74 @@ function rsa_public_components_from_private_bytes(raw)
     catch
         pkcs1 = unwrap_pkcs8_private_key(bytes)
         return parse_rsa_pkcs1_private_key(pkcs1)
+    end
+end
+
+"""
+    generate_rsa_private_key(; bits=2048) -> String
+
+Generates a new RSA private key in PEM format using OpenSSL. Returns the key as a
+PEM-encoded string suitable for use with [`rsa_signer_from_bytes`](@ref) or
+[`JWTAccessTokenIssuer`](@ref).
+
+# Arguments
+- `bits`: RSA key size in bits (default: 2048). Common values are 2048, 3072, or 4096.
+
+# Examples
+```julia
+private_key = generate_rsa_private_key(bits=2048)
+issuer = JWTAccessTokenIssuer(
+    issuer="https://example.com",
+    audience=["https://api.example.com"],
+    private_key=private_key,
+    alg=:RS256
+)
+```
+
+# Note
+This function requires OpenSSL to be installed and available in your PATH.
+"""
+function generate_rsa_private_key(; bits::Integer=2048)
+    bits > 0 || error("RSA key size must be positive")
+    cmd = `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:$bits`
+    try
+        return read(cmd, String)
+    catch e
+        error("Failed to generate RSA key: $(e)")
+    end
+end
+
+"""
+    generate_ec_private_key(; curve=:P256) -> String
+
+Generates a new EC private key in PEM format using OpenSSL. Returns the key as a
+PEM-encoded string suitable for use with [`ecc_signer_from_bytes`](@ref) or
+[`JWTAccessTokenIssuer`](@ref).
+
+# Arguments
+- `curve`: EC curve name (default: `:P256`). Supported values are `:P256` or `:P384`.
+
+# Examples
+```julia
+private_key = generate_ec_private_key(curve=:P256)
+issuer = JWTAccessTokenIssuer(
+    issuer="https://example.com",
+    audience=["https://api.example.com"],
+    private_key=private_key,
+    alg=:ES256
+)
+```
+
+# Note
+This function requires OpenSSL to be installed and available in your PATH.
+"""
+function generate_ec_private_key(; curve::Symbol=:P256)
+    curve in (:P256, :P384) || error("Unsupported EC curve: $curve (supported: :P256, :P384)")
+    curve_name = curve == :P256 ? "prime256v1" : "secp384r1"
+    cmd = `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:$curve_name`
+    try
+        return read(cmd, String)
+    catch e
+        error("Failed to generate EC key: $(e)")
     end
 end

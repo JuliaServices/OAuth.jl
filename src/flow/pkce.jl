@@ -470,6 +470,47 @@ function refresh_pkce_token(
 end
 
 """
+    refresh_if_expiring(result; skew_seconds=60, http=HTTP, extra_token_params=Dict(), verbose=nothing) -> NamedTuple
+
+Refreshes a PKCE result if the access token is expiring soon. Returns the
+original result when the token is still valid.
+"""
+function refresh_if_expiring(
+    result::NamedTuple;
+    skew_seconds::Integer=60,
+    http=HTTP,
+    extra_token_params=Dict{String,String}(),
+    verbose::Union{Bool,Nothing}=nothing,
+)
+    haskey(result, :token) || throw(ArgumentError("result must include a :token field"))
+    token_expiring(result.token; skew_seconds=skew_seconds) || return result
+    return refresh_pkce_token(result; http=http, extra_token_params=extra_token_params, verbose=verbose)
+end
+
+"""
+    load_or_refresh_token(metadata, config; skew_seconds=60, http=HTTP, extra_token_params=Dict(), verbose=nothing) -> TokenResponse
+
+Loads the stored token response from the configured refresh token store and
+refreshes it if it is close to expiring.  Requires a store that persists
+full token responses (e.g. `FileBasedRefreshTokenStore`).
+"""
+function load_or_refresh_token(
+    metadata::AuthorizationServerMetadata,
+    config::PublicClientConfig;
+    skew_seconds::Integer=60,
+    http=HTTP,
+    extra_token_params=Dict{String,String}(),
+    verbose::Union{Bool,Nothing}=nothing,
+)
+    verbose = effective_verbose(config, verbose)
+    token = load_token_response(config)
+    token === nothing && throw(OAuthError(:configuration_error, "Stored token response is not available"))
+    token_expiring(token; skew_seconds=skew_seconds) || return token
+    refreshed = refresh_pkce_token(metadata, config; http=http, extra_token_params=extra_token_params, verbose=verbose)
+    return refreshed
+end
+
+"""
     wait_for_authorization_code(session; timeout=120) -> NamedTuple
 
 Blocks until the loopback listener created in `start_pkce_authorization`

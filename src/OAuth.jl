@@ -31,6 +31,9 @@ export fetch_protected_resource_metadata, fetch_authorization_server_metadata, d
 export select_authorization_server
 export build_authorization_url
 export generate_pkce_verifier, pkce_challenge
+export generate_ed25519_keypair, generate_rsa_private_key, generate_ec_private_key
+export token_expiring, refresh_if_expiring
+export load_token_response, save_token_response!, load_or_refresh_token
 export launch_browser
 export start_pkce_authorization, start_pkce_authorization_from_issuer, start_device_authorization, start_device_authorization_from_issuer
 export exchange_code_for_token, wait_for_authorization_code

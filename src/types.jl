@@ -65,17 +65,18 @@ function FileBasedRefreshTokenStore(path::AbstractString; permissions::Union{Int
     return FileBasedRefreshTokenStore(resolved_path, perm_value, resolved_lock, stale)
 end
 
-const REFRESH_TOKEN_FILE_VERSION = 1
-const REFRESH_TOKEN_FILE_ENCODING = "base64"
+const TOKEN_FILE_VERSION = 2
+const TOKEN_FILE_ENCODING = "base64"
 
 function refresh_token_file_contents(token::String)
     payload = Dict(
-        "version" => REFRESH_TOKEN_FILE_VERSION,
-        "encoding" => REFRESH_TOKEN_FILE_ENCODING,
-        "token" => Base64.base64encode(token),
+        "version" => TOKEN_FILE_VERSION,
+        "encoding" => TOKEN_FILE_ENCODING,
+        "refresh_token" => Base64.base64encode(token),
     )
     return JSON.json(payload) * "\n"
 end
+
 
 refresh_token_dir(path::AbstractString) = begin
     dir = dirname(path)
@@ -98,7 +99,22 @@ function apply_refresh_token_permissions(path::AbstractString, permissions::Unio
     end
 end
 
-function decode_refresh_token_document(raw::String)
+function decode_token_field(value, encoding::String)
+    value isa AbstractString || return nothing
+    if encoding == TOKEN_FILE_ENCODING
+        decoded = try
+            Base64.base64decode(String(value))
+        catch
+            nothing
+        end
+        return decoded === nothing ? nothing : String(decoded)
+    elseif encoding == "plain"
+        return String(value)
+    end
+    return nothing
+end
+
+function decode_token_document(raw::String)
     stripped = strip(raw)
     isempty(stripped) && return nothing
     parsed = try
@@ -107,9 +123,7 @@ function decode_refresh_token_document(raw::String)
         nothing
     end
     if parsed isa AbstractDict
-        token_value = get(parsed, "token", nothing)
-        token_value isa AbstractString || return nothing
-        version_value = get(parsed, "version", REFRESH_TOKEN_FILE_VERSION)
+        version_value = get(() -> TOKEN_FILE_VERSION, parsed, "version")
         version = if version_value isa Integer
             version_value
         elseif version_value isa AbstractString
@@ -120,22 +134,33 @@ function decode_refresh_token_document(raw::String)
             nothing
         end
         version === nothing && return nothing
-        version == REFRESH_TOKEN_FILE_VERSION || return nothing
-        encoding = get(parsed, "encoding", REFRESH_TOKEN_FILE_ENCODING)
-        if encoding == REFRESH_TOKEN_FILE_ENCODING
-            decoded = try
-                Base64.base64decode(String(token_value))
-            catch _
-                nothing
-            end
-            return decoded === nothing ? nothing : String(decoded)
-        elseif encoding == "plain"
-            return String(token_value)
-        else
-            return nothing
-        end
+        version == TOKEN_FILE_VERSION || return nothing
+        encoding_value = get(() -> TOKEN_FILE_ENCODING, parsed, "encoding")
+        encoding = encoding_value isa AbstractString ? String(encoding_value) : TOKEN_FILE_ENCODING
+        access_token = decode_token_field(get(() -> nothing, parsed, "access_token"), encoding)
+        refresh_token = decode_token_field(get(() -> nothing, parsed, "refresh_token"), encoding)
+        refresh_token === nothing && (refresh_token = decode_token_field(get(() -> nothing, parsed, "token"), encoding))
+        expires_at_value = get(() -> nothing, parsed, "expires_at")
+        expires_at = expires_at_value === nothing ? nothing : try_parse_time(expires_at_value)
+        token_type = get(() -> nothing, parsed, "token_type")
+        token_type = token_type isa AbstractString ? String(token_type) : nothing
+        scope = get(() -> nothing, parsed, "scope")
+        scope = scope isa AbstractString ? String(scope) : nothing
+        return (
+            access_token = access_token,
+            refresh_token = refresh_token,
+            expires_at = expires_at,
+            token_type = token_type,
+            scope = scope,
+        )
     end
-    return stripped
+    return (
+        access_token = nothing,
+        refresh_token = stripped,
+        expires_at = nothing,
+        token_type = nothing,
+        scope = nothing,
+    )
 end
 
 function with_refresh_token_lock(f::Function, store::FileBasedRefreshTokenStore, verbose::Bool)
@@ -746,13 +771,15 @@ function load_refresh_token(store::FileBasedRefreshTokenStore, config::PublicCli
             verbose && @warn "Failed to read refresh token file" path=store.path err=err
             return nothing
         end
-        token = decode_refresh_token_document(raw)
-        if token === nothing && verbose
+        token = decode_token_document(raw)
+        refresh_token = token === nothing ? nothing : token.refresh_token
+        if refresh_token === nothing && verbose
             @warn "Refresh token file did not contain a usable token" path=store.path
         end
-        return token
+        return refresh_token
     end
 end
+
 
 function save_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicClientConfig, token::String)
     verbose = config_verbose(config)
@@ -775,6 +802,7 @@ function save_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicCl
         end
     end
 end
+
 
 function clear_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicClientConfig)
     verbose = config_verbose(config)
@@ -809,6 +837,17 @@ talking to the store directly.
 """
 function load_refresh_token(config::PublicClientConfig)
     return load_refresh_token(config.refresh_token_store, config)
+end
+
+"""
+    load_token_response(config::PublicClientConfig) -> Union{TokenResponse,Nothing}
+
+Asks the configured store (if any) for the most recently saved token
+response.  Only `FileBasedRefreshTokenStore` currently persists full token
+data.
+"""
+function load_token_response(config::PublicClientConfig)
+    return load_token_response(config.refresh_token_store, config)
 end
 
 """
@@ -896,6 +935,98 @@ Base.@kwdef struct TokenResponse
     issued_token_type::Union{String,Nothing}
     extra::Dict{String,Any}
     raw::JSONObject
+end
+
+function token_file_contents(token::TokenResponse)
+    payload = Dict(
+        "version" => TOKEN_FILE_VERSION,
+        "encoding" => TOKEN_FILE_ENCODING,
+        "access_token" => Base64.base64encode(token.access_token),
+        "refresh_token" => token.refresh_token === nothing ? nothing : Base64.base64encode(token.refresh_token),
+        "expires_at" => token.expires_at === nothing ? nothing : string(token.expires_at),
+        "token_type" => token.token_type,
+        "scope" => token.scope,
+    )
+    return JSON.json(payload) * "\n"
+end
+
+"""
+    save_token_response!(config::PublicClientConfig, token::TokenResponse)
+
+Persists a full token response (access token, refresh token, and expiry) via
+the configured store.
+"""
+function save_token_response!(config::PublicClientConfig, token::TokenResponse)
+    save_token_response!(config.refresh_token_store, config, token)
+    return
+end
+
+load_token_response(::RefreshTokenStore, ::PublicClientConfig) = nothing
+function save_token_response!(store::RefreshTokenStore, config::PublicClientConfig, token::TokenResponse)
+    token.refresh_token === nothing && return
+    save_refresh_token!(store, config, token.refresh_token)
+    return
+end
+load_token_response(::Nothing, ::PublicClientConfig) = nothing
+save_token_response!(::Nothing, ::PublicClientConfig, ::TokenResponse) = nothing
+
+function load_token_response(store::FileBasedRefreshTokenStore, config::PublicClientConfig)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ispath(store.path) || return nothing
+        raw = try
+            read(store.path, String)
+        catch err
+            verbose && @warn "Failed to read refresh token file" path=store.path err=err
+            return nothing
+        end
+        stored = decode_token_document(raw)
+        stored === nothing && return nothing
+        stored.access_token === nothing && return nothing
+        data = Dict{String,Any}(
+            "access_token" => stored.access_token,
+        )
+        stored.refresh_token !== nothing && (data["refresh_token"] = stored.refresh_token)
+        stored.expires_at !== nothing && (data["expires_at"] = string(stored.expires_at))
+        stored.token_type !== nothing && (data["token_type"] = stored.token_type)
+        stored.scope !== nothing && (data["scope"] = stored.scope)
+        token_json = JSON.parse(Vector{UInt8}(codeunits(JSON.json(data))))
+        return TokenResponse(token_json)
+    end
+end
+
+function save_token_response!(store::FileBasedRefreshTokenStore, config::PublicClientConfig, token::TokenResponse)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ensure_refresh_token_dir(store.path)
+        dir = refresh_token_dir(store.path)
+        tmp = tempname(dir)
+        try
+            open(tmp, "w") do io
+                write(io, token_file_contents(token))
+            end
+            apply_refresh_token_permissions(tmp, store.permissions, verbose)
+            mv(tmp, store.path; force=true)
+            apply_refresh_token_permissions(store.path, store.permissions, verbose)
+        catch err
+            verbose && @warn "Failed to write refresh token file" path=store.path err=err
+            rethrow(err)
+        finally
+            ispath(tmp) && tmp != store.path && rm(tmp; force=true)
+        end
+    end
+end
+
+"""
+    token_expiring(token; skew_seconds=60, now=Dates.now(UTC)) -> Bool
+
+Return `true` when `token.expires_at` is within `skew_seconds` of `now`.
+If `expires_at` is missing, returns `false`.
+"""
+function token_expiring(token::TokenResponse; skew_seconds::Integer=60, now::DateTime=Dates.now(UTC))
+    token.expires_at === nothing && return false
+    skew = Dates.Second(Int(skew_seconds))
+    return now + skew >= token.expires_at
 end
 
 """
@@ -1092,7 +1223,8 @@ function extract_cnf_jkt(data::JSONObject)
 end
 
 function persist_refresh_token!(config::PublicClientConfig, response::TokenResponse)
-    save_refresh_token!(config, response.refresh_token)
+    save_token_response!(config, response)
+    return
 end
 
 function try_parse_time(value)

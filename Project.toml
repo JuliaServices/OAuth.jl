@@ -1,6 +1,12 @@
 name = "OAuth"
-uuid = "818da804-8b6f-40df-b4a5-e161c4d67f0f"
+uuid = "22d8b318-f366-56fb-a292-a93f7d76c017"
 version = "1.0.0"
+
+[weakdeps]
+Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
+
+[extensions]
+OAuthPostgresExt = ["Postgres"]
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
@@ -16,10 +22,11 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
 [compat]
-HTTP = "1"
+HTTP = "1, 2"
 JSON = "1"
 LibAwsCal = "1.1"
 LibAwsCommon = "1.3.4"
+Postgres = "1"
 julia = "1.10"
 libsodium_jll = "1.0.21"
 

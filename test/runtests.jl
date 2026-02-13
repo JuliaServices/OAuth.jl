@@ -160,9 +160,9 @@ end
         save_refresh_token!(store, config, "refresh-123")
         @test load_refresh_token(store, config) == "refresh-123"
         doc = JSON.parse(read(path, String))
-        @test doc["version"] == 1
+        @test doc["version"] == 2
         @test doc["encoding"] == "base64"
-        @test String(Base64.base64decode(String(doc["token"]))) == "refresh-123"
+        @test String(Base64.base64decode(String(doc["refresh_token"]))) == "refresh-123"
         save_refresh_token!(store, config, "second-token")
         @test load_refresh_token(store, config) == "second-token"
         clear_refresh_token!(store, config)
