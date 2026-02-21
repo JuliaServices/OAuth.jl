@@ -1,5 +1,6 @@
-using Documenter, Example
+using Documenter
+using OAuth
 
-makedocs(modules = [Example], sitename = "Example.jl")
+makedocs(modules = [OAuth], sitename = "OAuth.jl", checkdocs = :none)
 
-deploydocs(repo = "github.com/quinnj/Example.jl.git", push_preview = true)
+deploydocs(repo = "github.com/JuliaServices/OAuth.jl.git", push_preview = true)

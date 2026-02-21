@@ -1418,6 +1418,19 @@ function free_port()
     return port
 end
 
+function dispatch_loopback_callback(url::AbstractString; attempts::Integer=60, delay::Real=0.1)
+    last_error = nothing
+    for _ in 1:attempts
+        try
+            return HTTP.get(url; status_exception=false)
+        catch err
+            last_error = err
+            sleep(delay)
+        end
+    end
+    error("Failed to send loopback callback request after $(attempts) attempts: $(last_error)")
+end
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(
@@ -1459,11 +1472,14 @@ end
     @test session.listener !== nothing
     redirect_url = "http://$(DEFAULT_LOOPBACK_HOST):$(port)$(DEFAULT_LOOPBACK_PATH)"
     @test session.redirect_uri == redirect_url
-    @async begin
-        sleep(0.1)
-        HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port)$(DEFAULT_LOOPBACK_PATH)?code=abc123&state=$(session.state)")
-    end
-    callback = wait_for_authorization_code(session; timeout=5)
+    callback_task = @async dispatch_loopback_callback(
+        "http://$(DEFAULT_LOOPBACK_HOST):$(port)$(DEFAULT_LOOPBACK_PATH)?code=abc123&state=$(session.state)";
+        attempts=80,
+        delay=0.1,
+    )
+    callback = wait_for_authorization_code(session; timeout=12)
+    callback_response = fetch(callback_task)
+    @test callback_response.status == 200
     @test callback.code == "abc123"
     @test callback.state == session.state
     token = exchange_code_for_token(session.authorization_server, session.client_config, callback.code, session.verifier; http=mock_http)
@@ -1512,8 +1528,12 @@ end
             timeout=5,
         )
     end
-    sleep(0.2)
-    HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port)$(DEFAULT_LOOPBACK_PATH)?code=xyz789&state=$(state_value)")
+    callback_response = dispatch_loopback_callback(
+        "http://$(DEFAULT_LOOPBACK_HOST):$(port)$(DEFAULT_LOOPBACK_PATH)?code=xyz789&state=$(state_value)";
+        attempts=80,
+        delay=0.1,
+    )
+    @test callback_response.status == 200
     result = fetch(task)
     @test result.token.access_token == "tokenXYZ"
     @test result.callback.code == "xyz789"
@@ -1535,8 +1555,12 @@ end
             timeout=5,
         )
     end
-    sleep(0.2)
-    HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port2)$(DEFAULT_LOOPBACK_PATH)?code=uvw000&state=$(state2)")
+    callback_response2 = dispatch_loopback_callback(
+        "http://$(DEFAULT_LOOPBACK_HOST):$(port2)$(DEFAULT_LOOPBACK_PATH)?code=uvw000&state=$(state2)";
+        attempts=80,
+        delay=0.1,
+    )
+    @test callback_response2.status == 200
     result2 = fetch(task2)
     @test result2.token.access_token == "tokenXYZ"
     @test result2.callback.code == "uvw000"

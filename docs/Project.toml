@@ -1,5 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+OAuth = "22d8b318-f366-56fb-a292-a93f7d76c017"
 
 [compat]
-Documenter = "0.27"
+Documenter = "1"
