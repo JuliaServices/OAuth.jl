@@ -1035,6 +1035,57 @@ end
     @test OAuth.load_refresh_token(config2) === nothing
 end
 
+@testset "load_or_refresh_token file-store locking" begin
+    mktempdir() do dir
+        path = joinpath(dir, "token.json")
+        store = FileBasedRefreshTokenStore(path; permissions=nothing)
+        config = PublicClientConfig(
+            client_id="client-refresh-lock",
+            redirect_uri="https://app.example/callback",
+            refresh_token_store=store,
+        )
+        metadata_doc = Dict(
+            "issuer" => "https://id.refresh",
+            "token_endpoint" => "https://id.refresh/token",
+        )
+        auth_meta = AuthorizationServerMetadata(JSON.parse(JSON.json(metadata_doc)))
+
+        expired_doc = Dict(
+            "access_token" => "expired-token",
+            "token_type" => "Bearer",
+            "refresh_token" => "refresh-old",
+            "expires_at" => "2000-01-01T00:00:00",
+        )
+        OAuth.save_token_response!(config, TokenResponse(JSON.parse(JSON.json(expired_doc))))
+
+        post_count = Base.Threads.Atomic{Int}(0)
+        token_doc = Dict(
+            "access_token" => "fresh-token",
+            "token_type" => "Bearer",
+            "refresh_token" => "refresh-new",
+            "expires_in" => 3600,
+        )
+        mock_http = (
+            post = (url; headers=nothing, body="", kwargs...) -> begin
+                @test url == "https://id.refresh/token"
+                Base.Threads.atomic_add!(post_count, 1)
+                sleep(0.2)
+                return HTTP.Response(200, JSON.json(token_doc))
+            end,
+        )
+
+        t1 = @async OAuth.load_or_refresh_token(auth_meta, config; http=mock_http)
+        t2 = @async OAuth.load_or_refresh_token(auth_meta, config; http=mock_http)
+        token1 = fetch(t1)
+        token2 = fetch(t2)
+
+        @test token1.access_token == "fresh-token"
+        @test token2.access_token == "fresh-token"
+        @test post_count[] == 1
+        @test OAuth.load_refresh_token(config) == "refresh-new"
+    end
+end
+
 @testset "Client credentials flow" begin
     metadata_doc = Dict(
         "issuer" => "https://id.m2m",

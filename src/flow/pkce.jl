@@ -331,6 +331,8 @@ function refresh_pkce_token(
     http=HTTP,
     extra_token_params=Dict{String,String}(),
     verbose::Union{Bool,Nothing}=nothing,
+    _persist_result::Bool=true,
+    _clear_invalid_grant::Bool=true,
 )
     verbose = effective_verbose(config, verbose)
     metadata.token_endpoint === nothing && throw(OAuthError(:metadata_error, "Token endpoint missing in issuer metadata"))
@@ -373,7 +375,7 @@ function refresh_pkce_token(
             if err isa AbstractDict
                 err_code = get(err, "error", nothing)
                 if err_code isa AbstractString && lowercase(String(err_code)) == "invalid_grant"
-                    clear_refresh_token!(config)
+                    _clear_invalid_grant && clear_refresh_token!(config)
                     description = get(err, "error_description", "invalid_grant")
                     message = description isa AbstractString ? String(description) : "invalid_grant"
                     throw(OAuthError(:invalid_grant, "Refresh token rejected: $(message)"))
@@ -386,7 +388,7 @@ function refresh_pkce_token(
     data isa AbstractDict || throw(OAuthError(:json_error, "Expected JSON object"))
     nonce_value = dpop_nonce_from_response(resp)
     token = TokenResponse(data; issued_at=issued_at, dpop_nonce=nonce_value)
-    persist_refresh_token!(config, token)
+    _persist_result && persist_refresh_token!(config, token)
     return token
 end
 
@@ -487,6 +489,56 @@ function refresh_if_expiring(
     return refresh_pkce_token(result; http=http, extra_token_params=extra_token_params, verbose=verbose)
 end
 
+function load_token_response_locked(store::FileBasedRefreshTokenStore, verbose::Bool)
+    ispath(store.path) || return nothing
+    raw = try
+        read(store.path, String)
+    catch err
+        verbose && @warn "Failed to read refresh token file" path=store.path err=err
+        return nothing
+    end
+    stored = decode_token_document(raw)
+    stored === nothing && return nothing
+    stored.access_token === nothing && return nothing
+    data = Dict{String,Any}(
+        "access_token" => stored.access_token,
+    )
+    stored.refresh_token !== nothing && (data["refresh_token"] = stored.refresh_token)
+    stored.expires_at !== nothing && (data["expires_at"] = string(stored.expires_at))
+    stored.token_type !== nothing && (data["token_type"] = stored.token_type)
+    stored.scope !== nothing && (data["scope"] = stored.scope)
+    token_json = JSON.parse(Vector{UInt8}(codeunits(JSON.json(data))))
+    return TokenResponse(token_json)
+end
+
+function save_token_response_locked!(store::FileBasedRefreshTokenStore, token::TokenResponse, verbose::Bool)
+    ensure_refresh_token_dir(store.path)
+    dir = refresh_token_dir(store.path)
+    tmp = tempname(dir)
+    try
+        open(tmp, "w") do io
+            write(io, token_file_contents(token))
+        end
+        apply_refresh_token_permissions(tmp, store.permissions, verbose)
+        mv(tmp, store.path; force=true)
+        apply_refresh_token_permissions(store.path, store.permissions, verbose)
+    catch err
+        verbose && @warn "Failed to write refresh token file" path=store.path err=err
+        rethrow(err)
+    finally
+        ispath(tmp) && tmp != store.path && rm(tmp; force=true)
+    end
+end
+
+function clear_token_response_locked!(store::FileBasedRefreshTokenStore, verbose::Bool)
+    ispath(store.path) || return
+    try
+        rm(store.path; force=true)
+    catch err
+        verbose && @warn "Failed to delete refresh token file" path=store.path err=err
+    end
+end
+
 """
     load_or_refresh_token(metadata, config; skew_seconds=60, http=HTTP, extra_token_params=Dict(), verbose=nothing) -> TokenResponse
 
@@ -503,6 +555,39 @@ function load_or_refresh_token(
     verbose::Union{Bool,Nothing}=nothing,
 )
     verbose = effective_verbose(config, verbose)
+    store = config.refresh_token_store
+    if store isa FileBasedRefreshTokenStore
+        return with_refresh_token_lock(store, verbose) do
+            token = load_token_response_locked(store, verbose)
+            token === nothing && throw(OAuthError(:configuration_error, "Stored token response is not available"))
+            token_expiring(token; skew_seconds=skew_seconds) || return token
+
+            refresh_value = token.refresh_token
+            refresh_value === nothing && throw(OAuthError(:configuration_error, "refresh_token is not available"))
+
+            refreshed = try
+                refresh_pkce_token(
+                    metadata,
+                    config;
+                    refresh_token=refresh_value,
+                    http=http,
+                    extra_token_params=extra_token_params,
+                    verbose=verbose,
+                    _persist_result=false,
+                    _clear_invalid_grant=false,
+                )
+            catch err
+                if err isa OAuthError && err.code == :invalid_grant
+                    clear_token_response_locked!(store, verbose)
+                end
+                rethrow(err)
+            end
+
+            save_token_response_locked!(store, refreshed, verbose)
+            return refreshed
+        end
+    end
+
     token = load_token_response(config)
     token === nothing && throw(OAuthError(:configuration_error, "Stored token response is not available"))
     token_expiring(token; skew_seconds=skew_seconds) || return token
