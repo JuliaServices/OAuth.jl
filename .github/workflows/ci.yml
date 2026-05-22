@@ -64,9 +64,7 @@ jobs:
           Pkg.instantiate()
       - name: Build and deploy docs
         shell: julia --color=yes --project=docs {0}
-        run: |
-          cd(ENV["GITHUB_WORKSPACE"])
-          include("docs/make.jl")
+        run: include(joinpath(ENV["GITHUB_WORKSPACE"], "docs", "make.jl"))
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
