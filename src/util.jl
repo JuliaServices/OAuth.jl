@@ -114,26 +114,69 @@ have an embedded server that handles a different callback path.
 """
 const DEFAULT_LOOPBACK_PATH = "/oauth/callback"
 
+header_key(header::Pair) = header.first
+header_value_part(header::Pair) = header.second
+header_key(header::Tuple) = header[1]
+header_value_part(header::Tuple) = header[2]
+header_tuple(header) = (String(header_key(header)), String(header_value_part(header)))
+
 function normalize_headers(headers)
-    if headers isa AbstractVector
-        return copy(headers)
-    else
-        return HTTP.Headers(headers)
+    source = headers isa AbstractVector ? headers : HTTP.Headers(headers)
+    return [header_tuple(header) for header in source]
+end
+
+function prepare_headers(headers)
+    normalized = normalize_headers(headers)
+    try
+        return HTTP.Headers(normalized)
+    catch err
+        err isa MethodError || rethrow()
+        return HTTP.Headers([key => value for (key, value) in normalized])
     end
 end
 
-prepare_headers(headers) = HTTP.Headers(normalize_headers(headers))
+function set_header_entry!(headers, idx, key::AbstractString, value::AbstractString)
+    entry = (String(key), String(value))
+    try
+        headers[idx] = entry
+    catch err
+        err isa MethodError || rethrow()
+        headers[idx] = entry[1] => entry[2]
+    end
+    return headers
+end
+
+function push_header_entry!(headers, key::AbstractString, value::AbstractString)
+    entry = (String(key), String(value))
+    try
+        push!(headers, entry)
+    catch err
+        err isa MethodError || rethrow()
+        push!(headers, entry[1] => entry[2])
+    end
+    return headers
+end
 
 function set_request_header!(headers, key::AbstractString, value::AbstractString)
     for idx in eachindex(headers)
         header_pair = headers[idx]
-        if ascii_lc_isequal(String(header_pair.first), key)
-            headers[idx] = String(key) => String(value)
-            return headers
+        if ascii_lc_isequal(String(header_key(header_pair)), key)
+            return set_header_entry!(headers, idx, key, value)
         end
     end
-    push!(headers, String(key) => String(value))
-    return headers
+    return push_header_entry!(headers, key, value)
+end
+
+function header_value(headers, key::AbstractString, default="")
+    sentinel = gensym()
+    value = HTTP.header(headers, key, sentinel)
+    value === sentinel || return value
+    for header in headers
+        if ascii_lc_isequal(String(header_key(header)), key)
+            return String(header_value_part(header))
+        end
+    end
+    return default
 end
 
 function normalize_body(body)
@@ -149,25 +192,26 @@ function normalize_body(body)
 end
 
 function http_request(http, method::AbstractString, url::AbstractString; verbose::Bool=false, kwargs...)
-    headers_in = get(kwargs, :headers, HTTP.Headers())
-    headers_vec = normalize_headers(headers_in)
-    body_in = get(kwargs, :body, nothing)
+    kwargs_nt = NamedTuple(kwargs)
+    headers = prepare_headers(get(kwargs_nt, :headers, HTTP.Headers()))
+    request_kwargs = Base.structdiff(kwargs_nt, NamedTuple{(:headers,)})
+    body_in = get(kwargs_nt, :body, nothing)
     if verbose
         method_str = uppercase(String(method))
         req_body = normalize_body(body_in)
-        req = HTTP.Request(method_str, url, headers_vec, req_body)
+        req = HTTP.Request(method_str, url, headers, req_body)
         println("→ HTTP $(method_str) $url")
         show(stdout, MIME"text/plain"(), req)
         println()
     end
     response = if hasproperty(http, :request)
-        getproperty(http, :request)(method, url; kwargs...)
+        getproperty(http, :request)(method, url; request_kwargs..., headers=headers)
     else
         method_sym = Symbol(lowercase(String(method)))
         if hasproperty(http, method_sym)
-            getproperty(http, method_sym)(url; kwargs...)
+            getproperty(http, method_sym)(url; request_kwargs..., headers=headers)
         else
-            HTTP.request(method, url; kwargs...)
+            HTTP.request(method, url; request_kwargs..., headers=headers)
         end
     end
     if verbose

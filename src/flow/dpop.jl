@@ -1,10 +1,10 @@
  
 
 function requires_dpop_nonce_retry(resp::HTTP.Response)
-    header_value = HTTP.header(resp.headers, "WWW-Authenticate", "")
-    isempty(header_value) && return false
+    www_authenticate = header_value(resp.headers, "WWW-Authenticate", "")
+    isempty(www_authenticate) && return false
     try
-        challenges = parse_www_authenticate(header_value)
+        challenges = parse_www_authenticate(www_authenticate)
         for challenge in challenges
             err = get(challenge.params, "error", nothing)
             if err !== nothing && lowercase(String(err)) == "use_dpop_nonce"
@@ -12,7 +12,7 @@ function requires_dpop_nonce_retry(resp::HTTP.Response)
             end
         end
     catch
-        return occursin("use_dpop_nonce", lowercase(String(header_value)))
+        return occursin("use_dpop_nonce", lowercase(String(www_authenticate)))
     end
     return false
 end
@@ -63,7 +63,7 @@ function oauth_request(
     attempts = 0
     nonce_value = use_dpop ? cached_dpop_nonce(dpop_auth, url) : nothing
     while true
-        headers_obj = HTTP.Headers(base_headers)
+        headers_obj = prepare_headers(base_headers)
         issued_at = now(UTC)
         if use_dpop
             proof = create_dpop_proof(dpop_auth, method, url, issued_at; nonce=nonce_value, access_token=token.access_token)

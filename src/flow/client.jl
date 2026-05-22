@@ -143,7 +143,7 @@ function register_dynamic_client(
     endpoint = String(metadata.registration_endpoint)
     ensure_https_url(endpoint, "registration_endpoint")
     payload = normalize_registration_metadata(client_metadata)
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Content-Type" => "application/json",
         "Accept" => "application/json",
     ])
@@ -201,7 +201,7 @@ function update_dynamic_client(
     registration_access_token === nothing && throw(ArgumentError("registration_access_token is required for client update"))
     ensure_https_url(configuration_endpoint, "client_configuration_endpoint")
     payload = normalize_registration_metadata(client_metadata)
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Content-Type" => "application/json",
         "Accept" => "application/json",
         "Authorization" => string("Bearer ", registration_access_token),
@@ -229,7 +229,7 @@ function delete_dynamic_client(
 )
     registration_access_token === nothing && throw(ArgumentError("registration_access_token is required for client deletion"))
     ensure_https_url(configuration_endpoint, "client_configuration_endpoint")
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Accept" => "application/json",
         "Authorization" => string("Bearer ", registration_access_token),
     ])

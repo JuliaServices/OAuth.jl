@@ -32,10 +32,10 @@ function normalize_metadata_dict(data)
     return dict
 end
 
-json_response(body; status::Integer=200) = HTTP.Response(status, HTTP.Headers(["Content-Type" => "application/json"]), JSON.json(body))
+json_response(body; status::Integer=200) = HTTP.Response(status, prepare_headers(["Content-Type" => "application/json"]), JSON.json(body))
 
 function json_no_store_response(body; status::Integer=200)
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Content-Type" => "application/json",
         "Cache-Control" => "no-store",
         "Pragma" => "no-cache",
@@ -49,7 +49,7 @@ struct AuthorizationCredentials
 end
 
 function authorization_credentials(req::HTTP.Request)
-    auth = HTTP.header(req.headers, "Authorization", "")
+    auth = header_value(req.headers, "Authorization", "")
     isempty(auth) && return nothing
     parts = split(auth, ' ')
     length(parts) == 2 || return nothing
@@ -80,6 +80,16 @@ function request_body_bytes(req::HTTP.Request)
         return UInt8[]
     else
         return Vector{UInt8}(codeunits(String(req.body)))
+    end
+end
+
+function request_method(req::HTTP.Request)
+    if hasproperty(req, :method)
+        return String(getproperty(req, :method))
+    elseif isdefined(HTTP, :method)
+        return String(getproperty(HTTP, :method)(req))
+    else
+        throw(ArgumentError("HTTP request type does not expose a method"))
     end
 end
 
@@ -123,8 +133,8 @@ function request_param_pairs(req::HTTP.Request)
     if !isempty(query)
         append!(pairs, parse_parameter_pairs(query))
     end
-    if HTTP.method(req) == "POST"
-        content_type = lowercase(String(HTTP.header(req.headers, "Content-Type", "")))
+    if request_method(req) == "POST"
+        content_type = lowercase(String(header_value(req.headers, "Content-Type", "")))
         if startswith(content_type, "application/x-www-form-urlencoded")
             body = request_body_bytes(req)
             append!(pairs, parse_parameter_pairs(String(body)))
@@ -901,7 +911,7 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
         normalized[String(k)] = String(v)
     end
     function authenticate(req::HTTP.Request, params::Dict{String,String})
-        header = HTTP.header(req.headers, "Authorization", "")
+        header = header_value(req.headers, "Authorization", "")
         if startswith(header, "Basic ")
             encoded = header[7:end]
             decoded = try
@@ -940,7 +950,7 @@ end
 function authorization_redirect_response(redirect_uri::AbstractString, state::Union{String,Nothing}, params::Vector{Pair{String,String}})
     state === nothing || push!(params, "state" => String(state))
     location = append_query_params(redirect_uri, params)
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Location" => location,
         "Cache-Control" => "no-store",
         "Pragma" => "no-cache",
@@ -976,9 +986,9 @@ stores issued codes in the configured store.
 """
 function build_authorization_endpoint(config::AuthorizationEndpointConfig)
     function handler(req::HTTP.Request)
-        method = HTTP.method(req)
+        method = request_method(req)
         if !(method == "GET" || method == "POST")
-            return HTTP.Response(405, HTTP.Headers(["Allow" => "GET, POST"]), "")
+            return HTTP.Response(405, prepare_headers(["Allow" => "GET, POST"]), "")
         end
         pairs = request_param_pairs(req)
         params = last_value_dict(pairs)
@@ -1080,7 +1090,7 @@ end
 function token_error_response(code::AbstractString, description::Union{String,Nothing}; status::Integer=400, headers=HTTP.Headers())
     body = Dict{String,Any}("error" => String(code))
     description !== nothing && (body["error_description"] = String(description))
-    response_headers = HTTP.Headers(headers)
+    response_headers = prepare_headers(headers)
     set_request_header!(response_headers, "Content-Type", "application/json")
     set_request_header!(response_headers, "Cache-Control", "no-store")
     set_request_header!(response_headers, "Pragma", "no-cache")
@@ -1109,7 +1119,7 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     catch err
         if err isa OAuthError
             if err.code == :invalid_client
-                headers = HTTP.Headers(["WWW-Authenticate" => "Basic realm=\"token\""])
+                headers = prepare_headers(["WWW-Authenticate" => "Basic realm=\"token\""])
                 return token_error_response("invalid_client", err.message; status=401, headers=headers)
             else
                 return token_error_response(String(err.code), err.message)
@@ -1157,7 +1167,7 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     !isempty(record.resource) && (response["resource"] = record.resource)
     refresh_token = config.refresh_token_generator(record, client)
     refresh_token === nothing || (response["refresh_token"] = String(refresh_token))
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Content-Type" => "application/json",
         "Cache-Control" => "no-store",
         "Pragma" => "no-cache",
@@ -1174,8 +1184,8 @@ issues JWT access tokens, and optionally persists refresh tokens.
 """
 function build_token_endpoint(config::TokenEndpointConfig)
     function handler(req::HTTP.Request)
-        HTTP.method(req) == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
-        content_type = lowercase(String(HTTP.header(req.headers, "Content-Type", "")))
+        request_method(req) == "POST" || return HTTP.Response(405, prepare_headers(["Allow" => "POST"]), "")
+        content_type = lowercase(String(header_value(req.headers, "Content-Type", "")))
         startswith(content_type, "application/x-www-form-urlencoded") || return token_error_response("invalid_request", "Content-Type must be application/x-www-form-urlencoded")
         pairs = request_param_pairs(req)
         params = last_value_dict(pairs)
@@ -1235,7 +1245,7 @@ end
 
 authenticate_request(::AllowAllAuthenticator, _req::HTTP.Request) = true
 function authenticate_request(auth::BasicCredentialsAuthenticator, req::HTTP.Request)
-    header = HTTP.header(req.headers, "Authorization", "")
+    header = header_value(req.headers, "Authorization", "")
     startswith(header, "Basic ") || return false
     encoded = header[7:end]
     decoded = try
@@ -1254,7 +1264,7 @@ end
 auth_challenge_headers(::AllowAllAuthenticator) = HTTP.Headers()
 function auth_challenge_headers(auth::BasicCredentialsAuthenticator)
     header = "Basic realm=\"$(auth.realm)\", charset=\"UTF-8\""
-    return HTTP.Headers(["WWW-Authenticate" => header])
+    return prepare_headers(["WWW-Authenticate" => header])
 end
 
 function unauthorized_endpoint_response(authenticator::EndpointAuthenticator)
@@ -1616,8 +1626,8 @@ function verify_dpop_proof(
     normalize_dpop_url(String(htu)) == expected_htu || throw(OAuthError(:invalid_token, "DPoP htu mismatch"))
     htm = get(payload, "htm", nothing)
     htm isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing htm"))
-    request_method = uppercase(String(HTTP.method(req)))
-    uppercase(String(htm)) == request_method || throw(OAuthError(:invalid_token, "DPoP htm mismatch"))
+    request_method_value = uppercase(request_method(req))
+    uppercase(String(htm)) == request_method_value || throw(OAuthError(:invalid_token, "DPoP htm mismatch"))
     ath = get(payload, "ath", nothing)
     ath isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing ath"))
     token_hash = base64url(SHA.sha256(codeunits(claims.token)))
@@ -1656,7 +1666,7 @@ end
 
 function unauthorized_response(resource_metadata_url; realm=nothing, required_scopes=String[], error_code=nothing, error_description=nothing, status::Integer=401)
     header = build_www_authenticate_header(resource_metadata_url; realm=realm, required_scopes=required_scopes, error_code=error_code, error_description=error_description)
-    return HTTP.Response(status, HTTP.Headers(["WWW-Authenticate" => header]), "")
+    return HTTP.Response(status, prepare_headers(["WWW-Authenticate" => header]), "")
 end
 
 """
@@ -1705,7 +1715,7 @@ function protected_resource_middleware(
             if scheme_lc != "dpop"
                 return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes, error_code="invalid_token", error_description="DPoP tokens must use the DPoP Authorization scheme")
             end
-            proof_header = HTTP.header(req.headers, "DPoP", "")
+            proof_header = header_value(req.headers, "DPoP", "")
             if isempty(proof_header)
                 return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes, error_code="invalid_token", error_description="Missing DPoP proof")
             end
@@ -1753,7 +1763,7 @@ the supplied `EndpointAuthenticator`.
 function build_introspection_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
-        HTTP.method(req) == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
+        request_method(req) == "POST" || return HTTP.Response(405, prepare_headers(["Allow" => "POST"]), "")
         body_bytes = request_body_bytes(req)
         params = parse_form_urlencoded(body_bytes)
         token = get(params, "token", nothing)
@@ -1798,7 +1808,7 @@ response envelope.
 function build_revocation_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
-        HTTP.method(req) == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
+        request_method(req) == "POST" || return HTTP.Response(405, prepare_headers(["Allow" => "POST"]), "")
         body_bytes = request_body_bytes(req)
         params = parse_form_urlencoded(body_bytes)
         token = get(params, "token", nothing)
@@ -1809,7 +1819,7 @@ function build_revocation_handler(store::InMemoryTokenStore; authenticator::Endp
             hint_lc == "access_token" || return json_no_store_response(Dict("error" => "unsupported_token_type"); status=400)
         end
         revoke_access_token!(store, token)
-        headers = HTTP.Headers([
+        headers = prepare_headers([
             "Cache-Control" => "no-store",
             "Pragma" => "no-cache",
         ])

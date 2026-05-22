@@ -14,11 +14,11 @@ function authorization_details_json(details)
 end
 
 function dpop_nonce_from_response(resp::HTTP.Response)
-    nonce_header = HTTP.header(resp.headers, "DPoP-Nonce", "")
+    nonce_header = header_value(resp.headers, "DPoP-Nonce", "")
     if !isempty(nonce_header)
         return String(nonce_header)
     end
-    www_value = HTTP.header(resp.headers, "WWW-Authenticate", "")
+    www_value = header_value(resp.headers, "WWW-Authenticate", "")
     isempty(www_value) && return nothing
     try
         for challenge in parse_www_authenticate(www_value)
@@ -204,7 +204,7 @@ function perform_token_request(
             proof = create_dpop_proof(dpop, "POST", url, issued_at; nonce=nonce_value)
             push!(request_headers, "DPoP" => proof)
         end
-        headers = HTTP.Headers(request_headers)
+        headers = prepare_headers(request_headers)
         resp = http_request(http, "POST", url; headers=headers, body=body, verbose=verbose, DEFAULT_TIMEOUT..., request_kwargs...)
         resp_nonce = dpop_nonce_from_response(resp)
         if dpop !== nothing && resp_nonce !== nothing
@@ -293,7 +293,7 @@ end
 
 function push_authorization_request(http, endpoint::AbstractString, request::AuthorizationRequest; verbose::Bool=false)
     ensure_https_url(endpoint, "pushed_authorization_request_endpoint")
-    headers = HTTP.Headers([
+    headers = prepare_headers([
         "Content-Type" => "application/x-www-form-urlencoded",
         "Accept" => "application/json",
     ])
