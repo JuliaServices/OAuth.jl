@@ -170,7 +170,7 @@ client = PublicClientConfig(
 )
 ```
 
-The file helper writes a tiny JSON blob—`{"version":1,"encoding":"base64","token":"…"}`—where the token body is base64 encoded so it is not sitting in obvious plain text when you open the file. Base64 only provides light obfuscation, so rely on the filesystem for real protection; on POSIX platforms the store calls `chmod 0o600` by default, and you can pass `permissions = nothing` to skip that step if you need to manage permissions yourself.
+The file helper writes a tiny JSON blob—`{"version":2,"encoding":"base64","refresh_token":"…"}`—where the token body is base64 encoded so it is not sitting in obvious plain text when you open the file. Base64 only provides light obfuscation, so rely on the filesystem for real protection; on POSIX platforms the store calls `chmod 0o600` by default, and you can pass `permissions = nothing` to skip that step if you need to manage permissions yourself.
 
 Each read/write is wrapped in [`FileWatching.mkpidlock`](https://docs.julialang.org/en/v1/stdlib/FileWatching/#FileWatching.mkpidlock), so multiple Julia processes (or REPLs) pointing at the same file will serialize access. Override `lock_path` or `stale_age` when constructing the store if you need to place the pidfile somewhere else or adjust how aggressively stale locks are reclaimed.
 

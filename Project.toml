@@ -1,6 +1,6 @@
 name = "OAuth"
 uuid = "22d8b318-f366-56fb-a292-a93f7d76c017"
-version = "1.0.0"
+version = "2.0.0"
 
 [weakdeps]
 Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
