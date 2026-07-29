@@ -16,7 +16,7 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
 [compat]
-HTTP = "1, 2"
+HTTP = "2"
 JSON = "1"
 LibAwsCal = "1.1"
 LibAwsCommon = "1.3.4"

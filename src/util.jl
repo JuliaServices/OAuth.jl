@@ -223,26 +223,98 @@ function http_request(http, method::AbstractString, url::AbstractString; verbose
     return response
 end
 
-function base64url(bytes::AbstractVector{UInt8})
-    encoded = Base64.base64encode(bytes)
-    stripped = replace(encoded, "+" => "-", "/" => "_")
-    return String(strip_trailing_equals(stripped))
-end
-
-function base64urldecode(str::AbstractString)
-    normalized = replace(replace(String(str), '-' => '+'), '_' => '/')
-    padding = (4 - length(normalized) % 4) % 4
-    padded = normalized * repeat("=", padding)
-    return Base64.base64decode(padded)
-end
-
-function strip_trailing_equals(str::AbstractString)
-    idx = lastindex(str)
-    while idx >= firstindex(str) && str[idx] == '='
-        idx = Base.prevind(str, idx)
+# base64url is implemented directly rather than via the Base64 stdlib because
+# base64encode/base64decode are built on Base64EncodePipe/Base64DecodePipe, which are
+# IO-based and cannot be resolved by the JuliaC `--trim=safe` verifier. Token encoding
+# is on the security-critical path, so it is worth keeping trim-clean.
+const BASE64URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+const BASE64URL_ENCODE_TABLE = Vector{UInt8}(codeunits(BASE64URL_CHARS))
+const BASE64URL_DECODE_TABLE = let table = fill(0xff, 256)
+    for (i, c) in enumerate(codeunits(BASE64URL_CHARS))
+        table[Int(c) + 1] = UInt8(i - 1)
     end
-    return idx < firstindex(str) ? "" : str[firstindex(str):idx]
+    # also accept the standard base64 alphabet, which callers sometimes hand us
+    table[Int(UInt8('+')) + 1] = 0x3e
+    table[Int(UInt8('/')) + 1] = 0x3f
+    table
 end
+
+"""
+    base64url(bytes) -> String
+
+Base64url-encode `bytes` without padding, per RFC 4648 Section 5.
+"""
+function base64url(bytes::AbstractVector{UInt8})
+    n = length(bytes)
+    n == 0 && return ""
+    out = Vector{UInt8}(undef, cld(n * 4, 3))
+    table = BASE64URL_ENCODE_TABLE
+    j = 0
+    i = firstindex(bytes)
+    last = lastindex(bytes)
+    @inbounds while i <= last
+        b1 = bytes[i]
+        if i + 2 <= last
+            b2 = bytes[i + 1]
+            b3 = bytes[i + 2]
+            out[j + 1] = table[Int(b1 >> 2) + 1]
+            out[j + 2] = table[Int(((b1 & 0x03) << 4) | (b2 >> 4)) + 1]
+            out[j + 3] = table[Int(((b2 & 0x0f) << 2) | (b3 >> 6)) + 1]
+            out[j + 4] = table[Int(b3 & 0x3f) + 1]
+            j += 4
+            i += 3
+        elseif i + 1 <= last
+            b2 = bytes[i + 1]
+            out[j + 1] = table[Int(b1 >> 2) + 1]
+            out[j + 2] = table[Int(((b1 & 0x03) << 4) | (b2 >> 4)) + 1]
+            out[j + 3] = table[Int((b2 & 0x0f) << 2) + 1]
+            j += 3
+            i += 2
+        else
+            out[j + 1] = table[Int(b1 >> 2) + 1]
+            out[j + 2] = table[Int((b1 & 0x03) << 4) + 1]
+            j += 2
+            i += 1
+        end
+    end
+    resize!(out, j)
+    return String(out)
+end
+
+"""
+    base64urldecode(str) -> Vector{UInt8}
+
+Decode a base64url string, with or without `=` padding. Also accepts the standard
+base64 alphabet. Throws `ArgumentError` on invalid input.
+"""
+function base64urldecode(str::AbstractString)
+    s = codeunits(String(str))
+    n = length(s)
+    @inbounds while n > 0 && s[n] == UInt8('=')
+        n -= 1
+    end
+    n == 0 && return UInt8[]
+    n % 4 == 1 && throw(ArgumentError("invalid base64url input: length $(n) leaves a dangling character"))
+    out = Vector{UInt8}(undef, (n * 3) >> 2)
+    table = BASE64URL_DECODE_TABLE
+    j = 0
+    acc = UInt32(0)
+    nbits = 0
+    @inbounds for k in 1:n
+        v = table[Int(s[k]) + 1]
+        v == 0xff && throw(ArgumentError("invalid base64url character: $(repr(Char(s[k])))"))
+        acc = (acc << 6) | UInt32(v)
+        nbits += 6
+        if nbits >= 8
+            nbits -= 8
+            j += 1
+            out[j] = UInt8((acc >> nbits) & 0xff)
+        end
+    end
+    resize!(out, j)
+    return out
+end
+
 
 strip_trailing_slash(url::String) = endswith(url, "/") ? url[1:end-1] : url
 

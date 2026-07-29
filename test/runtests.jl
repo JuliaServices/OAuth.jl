@@ -2399,6 +2399,39 @@ end
     resp_unsupported = plain(form_request("grant_type=refresh_token&refresh_token=x"))
     @test JSON.parse(String(resp_unsupported.body))["error"] == "unsupported_grant_type"
 end
+@testset "base64url matches the stdlib" begin
+    # base64url is hand-rolled to stay resolvable under `--trim=safe`; it must agree
+    # with the Base64 stdlib byte for byte, including at every padding boundary
+    for n in 0:200
+        bytes = rand(UInt8, n)
+        expected = replace(replace(Base64.base64encode(bytes), "+" => "-", "/" => "_"), "=" => "")
+        @test OAuth.base64url(bytes) == expected
+        @test OAuth.base64urldecode(OAuth.base64url(bytes)) == bytes
+    end
+    @test OAuth.base64url(UInt8[]) == ""
+    @test OAuth.base64urldecode("") == UInt8[]
+    # padding is optional on input, and the standard alphabet is accepted
+    @test OAuth.base64urldecode("aGVsbG8=") == Vector{UInt8}(codeunits("hello"))
+    @test OAuth.base64urldecode("aGVsbG8") == Vector{UInt8}(codeunits("hello"))
+    @test OAuth.base64urldecode(Base64.base64encode(UInt8[0xfb, 0xff, 0xfe])) == UInt8[0xfb, 0xff, 0xfe]
+    # invalid input is rejected rather than silently mis-decoded
+    @test_throws ArgumentError OAuth.base64urldecode("ab*d")
+    @test_throws ArgumentError OAuth.base64urldecode("abcde")
+end
+
+@testset "jwk_thumbprint concrete method" begin
+    bare = Dict{String,String}("kty" => "EC", "crv" => "P-256", "x" => "abc", "y" => "def")
+    # the concretely-typed and dynamic methods must agree
+    @test OAuth.jwk_thumbprint(bare) == OAuth.jwk_thumbprint(Dict{String,Any}(bare))
+    decorated = merge(bare, Dict{String,String}("kid" => "k", "alg" => "ES256", "use" => "sig"))
+    @test OAuth.jwk_thumbprint(decorated) == OAuth.jwk_thumbprint(bare)
+    @test_throws ArgumentError OAuth.jwk_thumbprint(Dict{String,String}("x" => "a"))
+    @test_throws ArgumentError OAuth.jwk_thumbprint(Dict{String,String}("kty" => "RSA", "n" => "a"))
+    @test OAuth.jwk_has_private_material(Dict{String,String}("kty" => "EC", "d" => "x"))
+    @test !OAuth.jwk_has_private_material(bare)
+end
+
+include("trim_compile_tests.jl")
 
 @testset "take_with_timeout does not discard a late redirect" begin
     # A redirect that lands while this task is descheduled (e.g. another task held
