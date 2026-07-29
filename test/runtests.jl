@@ -1431,6 +1431,28 @@ function dispatch_loopback_callback(url::AbstractString; attempts::Integer=60, d
     error("Failed to send loopback callback request after $(attempts) attempts: $(last_error)")
 end
 
+# The first real HTTP.get in a process must compile HTTP.jl's entire request
+# pipeline. Under the flags julia-actions/julia-runtest uses (--check-bounds=yes,
+# which invalidates precompiled native code) that takes ~16s, which is longer than
+# the callback timeouts below allow - so the loopback tests timed out on CI while
+# passing locally. Warm the client stack once, outside any timed section.
+function warmup_http_client()
+    port = free_port()
+    router = HTTP.Router()
+    HTTP.register!(router, "GET", "/warmup", _ -> HTTP.Response(200, "ok"))
+    server = HTTP.serve!(router, DEFAULT_LOOPBACK_HOST, port)
+    try
+        HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port)/warmup"; status_exception=false, retry=false)
+    catch err
+        @warn "HTTP client warmup failed; loopback tests may be slow to start" err
+    finally
+        close(server)
+    end
+    return nothing
+end
+
+warmup_http_client()
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(
