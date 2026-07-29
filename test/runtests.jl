@@ -1431,6 +1431,28 @@ function dispatch_loopback_callback(url::AbstractString; attempts::Integer=60, d
     error("Failed to send loopback callback request after $(attempts) attempts: $(last_error)")
 end
 
+# The first real HTTP.get in a process must compile HTTP.jl's entire request
+# pipeline. Under the flags julia-actions/julia-runtest uses (--check-bounds=yes,
+# which invalidates precompiled native code) that takes ~16s, which is longer than
+# the callback timeouts below allow - so the loopback tests timed out on CI while
+# passing locally. Warm the client stack once, outside any timed section.
+function warmup_http_client()
+    port = free_port()
+    router = HTTP.Router()
+    HTTP.register!(router, "GET", "/warmup", _ -> HTTP.Response(200, "ok"))
+    server = HTTP.serve!(router, DEFAULT_LOOPBACK_HOST, port)
+    try
+        HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port)/warmup"; status_exception=false, retry=false)
+    catch err
+        @warn "HTTP client warmup failed; loopback tests may be slow to start" err
+    finally
+        close(server)
+    end
+    return nothing
+end
+
+warmup_http_client()
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(
@@ -2301,4 +2323,20 @@ end
     plain = build_token_endpoint(plain_cfg)
     resp_unsupported = plain(form_request("grant_type=refresh_token&refresh_token=x"))
     @test JSON.parse(String(resp_unsupported.body))["error"] == "unsupported_grant_type"
+end
+
+@testset "take_with_timeout does not discard a late redirect" begin
+    # A redirect that lands while this task is descheduled (e.g. another task held
+    # the thread) must still be returned rather than reported as a timeout.
+    channel = Channel{OAuth.StringParams}(1)
+    params = OAuth.StringParams("code" => "abc", "state" => "s")
+    put!(channel, params)
+    @test OAuth.take_with_timeout(channel, 0) == params
+
+    empty_channel = Channel{OAuth.StringParams}(1)
+    @test_throws OAuthError OAuth.take_with_timeout(empty_channel, 0)
+
+    delivered = Channel{OAuth.StringParams}(1)
+    @async (sleep(0.2); put!(delivered, params))
+    @test OAuth.take_with_timeout(delivered, 5) == params
 end
