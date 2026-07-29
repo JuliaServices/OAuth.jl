@@ -547,6 +547,35 @@ function base64urlencode(data)
     end
 end
 
+# RFC 7638 thumbprint members are all strings, so this path needs no dynamic JSON
+# encoding. Keeping it concretely typed also keeps it resolvable under `--trim=safe`.
+function json_quote(s::String)
+    out = IOBuffer()
+    write(out, '"')
+    for b in codeunits(s)
+        if b == UInt8('"')
+            write(out, "\\\"")
+        elseif b == UInt8('\\')
+            write(out, "\\\\")
+        elseif b < 0x20
+            write(out, "\\u", string(b; base=16, pad=4))
+        else
+            write(out, b)
+        end
+    end
+    write(out, '"')
+    return String(take!(out))
+end
+
+function canonical_json(obj::Dict{String,String})
+    ordered = sort(collect(keys(obj)))
+    parts = Vector{String}(undef, length(ordered))
+    for (i, key) in enumerate(ordered)
+        parts[i] = string(json_quote(key), ":", json_quote(obj[key]))
+    end
+    return "{" * join(parts, ",") * "}"
+end
+
 function canonical_json(obj::Dict{String,Any})
     ordered = sort(collect(keys(obj)))
     parts = Vector{String}(undef, length(ordered))
@@ -574,30 +603,44 @@ Compute the RFC 7638 JWK SHA-256 thumbprint, base64url encoded. Only the require
 members for the key type participate in the digest, so a JWK carrying extra members
 such as `kid`, `alg`, or `use` yields the same thumbprint as its bare counterpart.
 """
-function jwk_thumbprint(jwk::Dict{String,Any})
-    kty_value = get(jwk, "kty", nothing)
-    kty_value isa AbstractString || throw(ArgumentError("JWK is missing the required kty member"))
-    kty = uppercase(String(kty_value))
-    members = get(JWK_THUMBPRINT_MEMBERS, kty, nothing)
+# The concretely-typed method carries the logic; Dict{String,Any} inputs (what JSON
+# parsing yields) are normalised into it first, which keeps this resolvable under
+# `--trim=safe` - a JWK's required members are strings by definition.
+function jwk_thumbprint(jwk::Dict{String,String})
+    kty_value = get(jwk, "kty", "")
+    isempty(kty_value) && throw(ArgumentError("JWK is missing the required kty member"))
+    members = get(JWK_THUMBPRINT_MEMBERS, uppercase(kty_value), nothing)
     members === nothing && throw(ArgumentError("Unsupported JWK kty for thumbprint: $(kty_value)"))
-    required = Dict{String,Any}()
+    required = Dict{String,String}()
     for member in members
-        value = get(jwk, member, nothing)
         if member == "kty"
-            required[member] = String(kty_value)
+            required[member] = kty_value
             continue
         end
-        value isa AbstractString || throw(ArgumentError("JWK is missing required member $(member) for kty=$(kty_value)"))
-        required[member] = String(value)
+        value = get(jwk, member, "")
+        isempty(value) && throw(ArgumentError("JWK is missing required member $(member) for kty=$(kty_value)"))
+        required[member] = value
     end
     canonical = canonical_json(required)
     digest = SHA.sha256(codeunits(canonical))
     return base64urlencode(digest)
 end
 
+function jwk_thumbprint(jwk::AbstractDict)
+    normalized = Dict{String,String}()
+    for (k, v) in jwk
+        k isa AbstractString || continue
+        v isa AbstractString || continue
+        normalized[String(k)] = String(v)
+    end
+    haskey(normalized, "kty") || throw(ArgumentError("JWK is missing the required kty member"))
+    return jwk_thumbprint(normalized)
+end
+
 # RFC 9449 Section 4.3: a DPoP proof's `jwk` header must carry only public key material.
 const JWK_PRIVATE_MEMBERS = ("d", "p", "q", "dp", "dq", "qi", "oth", "k")
 
+jwk_has_private_material(jwk::Dict{String,String}) = any(member -> haskey(jwk, member), JWK_PRIVATE_MEMBERS)
 jwk_has_private_material(jwk::AbstractDict) = any(member -> haskey(jwk, member), JWK_PRIVATE_MEMBERS)
 
 function build_jws_compact(header::Dict{String,Any}, payload::Dict{String,Any}, signer::JWTSigner, alg::Symbol)
