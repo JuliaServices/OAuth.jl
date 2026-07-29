@@ -277,6 +277,31 @@ function normalize_string_params(params)
 end
 
 """
+    secure_compare(a, b) -> Bool
+
+Compare two strings or byte vectors in time that does not depend on the position of
+the first differing byte. Always prefer this helper over `==` when comparing secrets
+(client secrets, PKCE verifiers, token digests, key thumbprints) so that an attacker
+cannot recover a secret byte-by-byte by measuring response latency.
+
+Note that the *length* of the inputs is not hidden, which is standard for this
+construction and not sensitive for the values compared here.
+"""
+function secure_compare(a::AbstractVector{UInt8}, b::AbstractVector{UInt8})
+    length(a) == length(b) || return false
+    diff = UInt8(0)
+    for i in eachindex(a, b)
+        diff |= a[i] ⊻ b[i]
+    end
+    return diff == 0x00
+end
+
+secure_compare(a::AbstractString, b::AbstractString) = secure_compare(codeunits(String(a)), codeunits(String(b)))
+secure_compare(::Nothing, ::Any) = false
+secure_compare(::Any, ::Nothing) = false
+secure_compare(::Nothing, ::Nothing) = false
+
+"""
     secure_random_bytes(len; rng=RandomDevice())
 
 Return `len` uniformly distributed bytes sourced from a cryptographically secure RNG.

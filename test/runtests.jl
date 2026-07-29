@@ -1692,7 +1692,7 @@ end
     jwks_doc = JSON.parse(String(jwks_response.body))
     @test length(jwks_doc["keys"]) == 1
 
-    introspect = build_introspection_handler(store)
+    introspect = build_introspection_handler(store; authenticator = AllowAllAuthenticator())
     body = "token=$(issued.token)"
     req_introspect = HTTP.Request("POST", "/introspect", ["Content-Type" => "application/x-www-form-urlencoded"], body)
     resp_introspect = introspect(req_introspect)
@@ -1707,7 +1707,7 @@ end
     bad_hint_doc = JSON.parse(String(bad_hint_resp.body))
     @test bad_hint_doc["error"] == "unsupported_token_type"
 
-    revoke = build_revocation_handler(store)
+    revoke = build_revocation_handler(store; authenticator = AllowAllAuthenticator())
     req_revoke = HTTP.Request("POST", "/revoke", ["Content-Type" => "application/x-www-form-urlencoded"], body)
     resp_revoke = revoke(req_revoke)
     @test resp_revoke.status == 200
@@ -1891,6 +1891,513 @@ end
     issuer_call = issuer_post[]
     @test issuer_call[1] == "https://id.register/register"
     @test HTTP.header(issuer_call[2], "Authorization") == "Bearer issuer-token"
+end
+
+@testset "Constant-time secret comparison" begin
+    @test OAuth.secure_compare("abc", "abc")
+    @test !OAuth.secure_compare("abc", "abd")
+    @test !OAuth.secure_compare("abc", "abcd")
+    @test !OAuth.secure_compare("", "a")
+    @test OAuth.secure_compare("", "")
+    @test OAuth.secure_compare(UInt8[1, 2, 3], UInt8[1, 2, 3])
+    @test !OAuth.secure_compare(UInt8[1, 2, 3], UInt8[1, 2, 4])
+    @test !OAuth.secure_compare(nothing, "a")
+    @test !OAuth.secure_compare("a", nothing)
+    # non-ASCII must compare by bytes, not by character
+    @test OAuth.secure_compare("café", "café")
+    @test !OAuth.secure_compare("café", "cafe")
+end
+
+@testset "RFC 7638 JWK thumbprints" begin
+    # RFC 7638 Section 3.1 worked example
+    rfc_jwk = Dict{String,Any}(
+        "kty" => "RSA",
+        "n" => "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+        "e" => "AQAB",
+    )
+    @test OAuth.jwk_thumbprint(rfc_jwk) == "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+
+    # optional members must not change the thumbprint (RFC 7638 Section 3.2)
+    decorated = merge(rfc_jwk, Dict{String,Any}("alg" => "RS256", "kid" => "2011-04-29", "use" => "sig"))
+    @test OAuth.jwk_thumbprint(decorated) == OAuth.jwk_thumbprint(rfc_jwk)
+    # nor may private key material
+    @test OAuth.jwk_thumbprint(merge(rfc_jwk, Dict{String,Any}("d" => "abc"))) == OAuth.jwk_thumbprint(rfc_jwk)
+
+    ec_jwk = Dict{String,Any}("kty" => "EC", "crv" => "P-256", "x" => "abc", "y" => "def")
+    @test OAuth.jwk_thumbprint(merge(ec_jwk, Dict{String,Any}("kid" => "k", "use" => "sig"))) == OAuth.jwk_thumbprint(ec_jwk)
+    okp_jwk = Dict{String,Any}("kty" => "OKP", "crv" => "Ed25519", "x" => "abc")
+    @test OAuth.jwk_thumbprint(merge(okp_jwk, Dict{String,Any}("alg" => "EdDSA"))) == OAuth.jwk_thumbprint(okp_jwk)
+
+    @test_throws ArgumentError OAuth.jwk_thumbprint(Dict{String,Any}("n" => "a", "e" => "b"))
+    @test_throws ArgumentError OAuth.jwk_thumbprint(Dict{String,Any}("kty" => "WAT", "x" => "a"))
+    @test_throws ArgumentError OAuth.jwk_thumbprint(Dict{String,Any}("kty" => "RSA", "n" => "a"))
+
+    @test OAuth.jwk_has_private_material(Dict("kty" => "EC", "d" => "x"))
+    @test OAuth.jwk_has_private_material(Dict("kty" => "RSA", "q" => "x"))
+    @test !OAuth.jwk_has_private_material(Dict("kty" => "EC", "x" => "a", "y" => "b"))
+end
+
+@testset "EC public JWK derivation" begin
+    # regression: aws_ecc_key_pair_get_public_key returns void, so the old
+    # `result == 0` check made every EC issuer without an explicit public_jwk fail
+    ec_pem = fixture_string("ec_private.pem")
+    signer = OAuth.ecc_signer_from_bytes(ec_pem, :P256)
+    x, y = OAuth.ecc_public_coordinates(signer)
+    @test length(x) == 32
+    @test length(y) == 32
+
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example",
+        audience = ["https://api.example"],
+        private_key = ec_pem,
+        alg = :ES256,
+        kid = "ec-key",
+    )
+    jwk = public_jwk(issuer)
+    @test jwk["kty"] == "EC"
+    @test jwk["crv"] == "P-256"
+    @test jwk["kid"] == "ec-key"
+    # and the derived JWK must actually verify tokens the issuer signs
+    issued = issue_access_token(issuer; subject = "user-1", scope = ["read"])
+    validator = TokenValidationConfig(
+        issuer = "https://as.example",
+        audience = ["https://api.example"],
+        jwks = Dict("keys" => [jwk]),
+    )
+    claims = validate_jwt_access_token(issued.token, validator)
+    @test claims.subject == "user-1"
+end
+
+@testset "Malformed tokens yield 401 not 500" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example",
+        audience = ["https://api.example"],
+        private_key = rsa_pem,
+        alg = :RS256,
+        kid = "k1",
+    )
+    validator = TokenValidationConfig(
+        issuer = "https://as.example",
+        audience = ["https://api.example"],
+        jwks = Dict("keys" => [public_jwk(issuer)]),
+    )
+
+    seg(x) = OAuth.base64urlencode(x)
+    bad_tokens = [
+        "notajwt",
+        "only.two",
+        "!!!.@@@.###",
+        "$(seg("notjson")).$(seg("notjson")).$(seg("sig"))",
+        "$(seg("[1,2,3]")).$(seg("[1,2,3]")).$(seg("sig"))",
+        "$(seg(JSON.json(Dict("typ" => "JWT")))).$(seg(JSON.json(Dict("iss" => "https://as.example")))).AAAA",
+        "$(seg(JSON.json(Dict("alg" => 42)))).$(seg(JSON.json(Dict()))).AAAA",
+    ]
+    for token in bad_tokens
+        @test_throws OAuthError validate_jwt_access_token(token, validator)
+    end
+
+    # the middleware must convert all of these into 401 responses
+    middleware = OAuth.protected_resource_middleware(
+        req -> HTTP.Response(200, "ok"),
+        validator;
+        resource_metadata_url = "https://api.example/.well-known/oauth-protected-resource",
+    )
+    for token in bad_tokens
+        req = HTTP.Request("GET", "/data", ["Authorization" => "Bearer $token"])
+        resp = middleware(req)
+        @test resp.status == 401
+    end
+
+    # Valid signatures over malformed claim types are still untrusted input.
+    now_seconds = Int(floor(Dates.datetime2unix(Dates.now(UTC))))
+    base_claims = Dict{String,Any}(
+        "iss" => "https://as.example",
+        "aud" => "https://api.example",
+        "iat" => now_seconds,
+        "exp" => now_seconds + 300,
+    )
+    malformed_claims = [
+        "aud" => Any[Dict("unexpected" => true)],
+        "scope" => Any["read", 42],
+        "sub" => Dict("unexpected" => true),
+        "nbf" => "later",
+        "cnf" => "not-an-object",
+    ]
+    for (name, value) in malformed_claims
+        payload = merge(base_claims, Dict{String,Any}(name => value))
+        token = OAuth.build_jws_compact(
+            Dict{String,Any}("alg" => "RS256", "kid" => "k1"),
+            payload,
+            issuer.signer,
+            :RS256,
+        )
+        @test_throws OAuthError validate_jwt_access_token(token, validator)
+        req = HTTP.Request("GET", "/data", ["Authorization" => "Bearer $token"])
+        @test middleware(req).status == 401
+    end
+
+    valid = issue_access_token(issuer; subject = "user-1")
+    wrong_scheme = HTTP.Request("GET", "/data", ["Authorization" => "Basic $(valid.token)"])
+    @test middleware(wrong_scheme).status == 401
+
+    # a JWKS entry without kty is a configuration error, not a KeyError
+    @test_throws ArgumentError TokenValidationConfig(
+        issuer = "https://as.example", audience = ["x"], jwks = Dict("keys" => [Dict("kid" => "a")]))
+    @test_throws ArgumentError TokenValidationConfig(
+        issuer = "https://as.example", audience = ["x"], jwks = Dict("keys" => ["notanobject"]))
+end
+
+@testset "Authorization header parsing" begin
+    creds(v) = OAuth.authorization_credentials(HTTP.Request("GET", "/", ["Authorization" => v]))
+    @test creds("Bearer abc").token == "abc"
+    @test creds("Bearer  abc").token == "abc"          # multiple spaces (RFC 9110)
+    @test creds("Bearer abc ").token == "abc"          # trailing whitespace
+    @test creds("  Bearer abc").token == "abc"
+    @test creds("Bearer abc").scheme == "Bearer"
+    @test creds("") === nothing
+    @test creds("Bearer") === nothing
+    @test creds("Bearer ") === nothing
+
+    # Authentication schemes are case-insensitive. OAuth client credentials
+    # additionally use application/x-www-form-urlencoded encoding before Base64.
+    endpoint_auth = client_credentials_authenticator(Dict("client name" => "s:cret"))
+    encoded = Base64.base64encode("client+name:s%3Acret")
+    client = endpoint_auth(
+        HTTP.Request("POST", "/token", ["Authorization" => "basic $encoded"]),
+        Dict{String,String}(),
+    )
+    @test client.client_id == "client name"
+    management_auth = BasicCredentialsAuthenticator(credentials = Dict("client" => "secret"))
+    management_req = HTTP.Request(
+        "POST",
+        "/introspect",
+        ["Authorization" => "bAsIc $(Base64.base64encode("client:secret"))"],
+    )
+    @test OAuth.authenticate_request(management_auth, management_req)
+end
+
+@testset "Authorization endpoint PKCE enforcement" begin
+    resolver = (req, client_id, requested) -> "https://app.example/cb"
+    consent = (req, ctx) -> grant_authorization("user-1")
+    location_of(resp) = OAuth.header_value(resp.headers, "Location", "")
+
+    # default: PKCE required, S256 only
+    store = InMemoryAuthorizationCodeStore()
+    handler = build_authorization_endpoint(AuthorizationEndpointConfig(
+        code_store = store, redirect_uri_resolver = resolver, consent_handler = consent))
+
+    resp = handler(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&state=s1"))
+    @test resp.status == 302
+    @test occursin("error=invalid_request", location_of(resp))
+    @test !occursin("code=", location_of(resp))
+    @test occursin("state=s1", location_of(resp))
+
+    # plain is rejected by default, both explicitly and via the RFC 7636 default
+    resp = handler(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=abc"))
+    @test occursin("error=invalid_request", location_of(resp))
+    resp = handler(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=abc&code_challenge_method=plain"))
+    @test occursin("error=invalid_request", location_of(resp))
+
+    # S256 is accepted
+    verifier = generate_pkce_verifier()
+    challenge = pkce_challenge(verifier)
+    resp = handler(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(challenge)&code_challenge_method=S256"))
+    @test occursin("code=", location_of(resp))
+
+    # opt out for legacy clients
+    lax_store = InMemoryAuthorizationCodeStore()
+    lax = build_authorization_endpoint(AuthorizationEndpointConfig(
+        code_store = lax_store, redirect_uri_resolver = resolver, consent_handler = consent,
+        require_pkce = false, allowed_code_challenge_methods = ["S256", "plain"]))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code"))
+    @test occursin("code=", location_of(resp))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(verifier.verifier)"))
+    @test occursin("code=", location_of(resp))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(repeat("a", 42))"))
+    @test occursin("error=invalid_request", location_of(resp))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(repeat("a", 42))%21"))
+    @test occursin("error=invalid_request", location_of(resp))
+
+    @test_throws ArgumentError AuthorizationEndpointConfig(
+        code_store = store, redirect_uri_resolver = resolver, consent_handler = consent,
+        allowed_code_challenge_methods = String[])
+    @test_throws ArgumentError AuthorizationEndpointConfig(
+        code_store = store, redirect_uri_resolver = resolver, consent_handler = consent,
+        allowed_code_challenge_methods = ["S512"])
+end
+
+@testset "In-memory stores evict expired entries" begin
+    now_time = Dates.now(UTC)
+    past = now_time - Dates.Hour(24)
+
+    code_store = InMemoryAuthorizationCodeStore()
+    for i in 1:50
+        store_authorization_code!(code_store, OAuth.AuthorizationCodeRecord(
+            "expired-$i", "c1", "https://app/cb", String[], "u", nothing, nothing,
+            past, past + Dates.Second(60), nothing, String[], Dict{String,Any}()))
+    end
+    @test length(code_store.records) == 1  # each insert purges the previously expired ones
+    live = OAuth.AuthorizationCodeRecord(
+        "live", "c1", "https://app/cb", String[], "u", nothing, nothing,
+        now_time, now_time + Dates.Hour(1), nothing, String[], Dict{String,Any}())
+    store_authorization_code!(code_store, live)
+    @test consume_authorization_code!(code_store, "live") !== nothing
+
+    token_store = InMemoryTokenStore()
+    for i in 1:50
+        store_access_token!(token_store, OAuth.IssuedAccessToken(
+            "expired-$i", Dict{String,Any}(), String[], past, past + Dates.Second(60), "c1", "u", nothing))
+    end
+    @test length(token_store.records) == 1
+    store_access_token!(token_store, OAuth.IssuedAccessToken(
+        "live", Dict{String,Any}(), String[], now_time, now_time + Dates.Hour(1), "c1", "u", nothing))
+    @test lookup_access_token(token_store, "live") !== nothing
+end
+
+@testset "Token endpoint grant type validation" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        private_key = rsa_pem, alg = :RS256)
+    store = InMemoryAuthorizationCodeStore()
+    authenticator = (req, params) -> TokenEndpointClient("c1"; public = true)
+    # grant types the built-in handler cannot serve must be rejected up front
+    @test_throws ArgumentError TokenEndpointConfig(
+        code_store = store, token_issuer = issuer, client_authenticator = authenticator,
+        allowed_grant_types = ["authorization_code", "refresh_token"])
+    @test_throws ArgumentError TokenEndpointConfig(
+        code_store = store, token_issuer = issuer, client_authenticator = authenticator,
+        allowed_grant_types = ["client_credentials"])
+    cfg = TokenEndpointConfig(
+        code_store = store, token_issuer = issuer, client_authenticator = authenticator)
+    @test "authorization_code" in cfg.allowed_grant_types
+end
+
+@testset "select_authorization_server exact issuer matching" begin
+    metadata = ProtectedResourceMetadata(JSON.parse("""{"authorization_servers":["https://idp.example"]}"""))
+    @test select_authorization_server(metadata) == "https://idp.example"
+    @test select_authorization_server(metadata; issuer = "https://idp.example") == "https://idp.example"
+    @test_throws OAuthError select_authorization_server(metadata; issuer = "https://idp.example/")
+    @test_throws OAuthError select_authorization_server(metadata; issuer = "https://other.example")
+
+    trailing = ProtectedResourceMetadata(JSON.parse("""{"authorization_servers":["https://idp.example/"]}"""))
+    @test select_authorization_server(trailing; issuer = "https://idp.example/") == "https://idp.example/"
+    @test_throws OAuthError select_authorization_server(trailing; issuer = "https://idp.example")
+end
+
+@testset "DPoP end-to-end with decorated JWK" begin
+    # Real-world clients (and OAuth.jl's own `public_jwk`) publish JWKs carrying
+    # kid/alg/use. Before the RFC 7638 fix those extra members changed the computed
+    # thumbprint, so the jkt never matched a compliant server's and DPoP broke.
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example",
+        audience = ["https://api.example.com"],
+        private_key = rsa_pem,
+        alg = :RS256,
+        kid = "k1",
+    )
+    validator = TokenValidationConfig(
+        issuer = "https://as.example",
+        audience = ["https://api.example.com"],
+        jwks = Dict("keys" => [public_jwk(issuer)]),
+    )
+    bare_jwk = Dict{String,Any}(
+        "kty" => "EC",
+        "crv" => "P-256",
+        "x" => "cp-fRlYuifWF9f3bsGBq3t5xueGOdsZ0vFSQRqrdJ2Y",
+        "y" => "5iaMGjmGzt5OiwUyK6GaMcMIm-IUrO5YbB0MxouBbew",
+    )
+    decorated_jwk = merge(bare_jwk, Dict{String,Any}("kid" => "dpop-1", "alg" => "ES256", "use" => "sig"))
+    client = DPoPAuth(private_key = fixture_string("ec_private.pem"), public_jwk = decorated_jwk)
+
+    # the thumbprint must match what a spec-compliant peer computes from the bare key
+    @test OAuth.dpop_thumbprint(client) == OAuth.jwk_thumbprint(bare_jwk)
+
+    token = issue_access_token(issuer; subject = "user-9", scope = ["read"],
+        confirmation_jkt = OAuth.jwk_thumbprint(bare_jwk))
+    resource_url = "https://api.example.com/.well-known/oauth-protected-resource"
+    middleware = protected_resource_middleware(
+        _ -> HTTP.Response(200, "ok"), validator;
+        resource_metadata_url = resource_url, required_scopes = ["read"])
+    proof = OAuth.create_dpop_proof(client, "GET", "https://api.example.com/resource",
+        Dates.now(UTC); access_token = token.token)
+    req = HTTP.Request("GET", "/resource",
+        ["Authorization" => "DPoP $(token.token)", "DPoP" => proof], "")
+    @test middleware(req).status == 200
+
+    # a proof whose jwk leaks private key material must be refused (RFC 9449 4.3)
+    ec_signer = OAuth.ecc_signer_from_bytes(fixture_string("ec_private.pem"), :P256)
+    leaky_header = Dict{String,Any}(
+        "typ" => "dpop+jwt",
+        "jwk" => merge(bare_jwk, Dict{String,Any}("d" => "AAAA")),
+    )
+    leaky_payload = Dict{String,Any}(
+        "htu" => "https://api.example.com/resource",
+        "htm" => "GET",
+        "iat" => Int(floor(Dates.datetime2unix(Dates.now(UTC)))),
+        "jti" => OAuth.random_state(),
+        "ath" => OAuth.base64url(SHA.sha256(codeunits(token.token))),
+    )
+    leaky_proof = OAuth.build_jws_compact(leaky_header, leaky_payload, ec_signer, :ES256)
+    leaky_req = HTTP.Request("GET", "/resource",
+        ["Authorization" => "DPoP $(token.token)", "DPoP" => leaky_proof], "")
+    resp = middleware(leaky_req)
+    @test resp.status == 401
+    @test occursin("private key material", OAuth.header_value(resp.headers, "WWW-Authenticate", ""))
+
+    malformed_headers = [
+        Dict{String,Any}("typ" => 42, "jwk" => bare_jwk),
+        Dict{String,Any}("typ" => "dpop+jwt", "jwk" => merge(bare_jwk, Dict{String,Any}("x" => "%%%"))),
+        Dict{String,Any}("typ" => "dpop+jwt", "jwk" => merge(bare_jwk, Dict{String,Any}("kty" => 42))),
+    ]
+    for malformed_header in malformed_headers
+        malformed_proof = OAuth.build_jws_compact(malformed_header, leaky_payload, ec_signer, :ES256)
+        malformed_req = HTTP.Request(
+            "GET",
+            "/resource",
+            ["Authorization" => "DPoP $(token.token)", "DPoP" => malformed_proof],
+            "",
+        )
+        @test middleware(malformed_req).status == 401
+    end
+end
+
+@testset "Management endpoints require an explicit authenticator" begin
+    store = InMemoryTokenStore()
+    # an unauthenticated introspection/revocation endpoint must be a deliberate choice
+    @test_throws ArgumentError build_introspection_handler(store)
+    @test_throws ArgumentError build_revocation_handler(store)
+    err = try
+        build_introspection_handler(store)
+    catch e
+        e
+    end
+    @test occursin("authenticator", err.msg)
+    @test occursin("AllowAllAuthenticator", err.msg)
+    # explicit opt-in still works
+    @test build_introspection_handler(store; authenticator = AllowAllAuthenticator()) isa Function
+    @test build_revocation_handler(store; authenticator = AllowAllAuthenticator()) isa Function
+    basic = BasicCredentialsAuthenticator(credentials = Dict("c" => "s"))
+    @test build_introspection_handler(store; authenticator = basic) isa Function
+    @test build_revocation_handler(store; authenticator = basic) isa Function
+end
+
+@testset "Token endpoint refresh_token grant" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        private_key = rsa_pem, alg = :RS256, kid = "k1")
+    validator = TokenValidationConfig(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        jwks = Dict("keys" => [public_jwk(issuer)]))
+
+    form_request(body) = HTTP.Request("POST", "/token",
+        ["Content-Type" => "application/x-www-form-urlencoded"], body)
+
+    function build_endpoint(; ttl = nothing)
+        code_store = InMemoryAuthorizationCodeStore()
+        grant_store = InMemoryRefreshTokenGrantStore()
+        cfg = TokenEndpointConfig(
+            code_store = code_store,
+            token_issuer = issuer,
+            client_authenticator = (req, params) -> TokenEndpointClient("c1"; public = true),
+            allowed_grant_types = ["authorization_code", "refresh_token"],
+            refresh_grant_store = grant_store,
+            refresh_token_ttl_seconds = ttl,
+        )
+        return build_token_endpoint(cfg), code_store, grant_store
+    end
+
+    # a refresh_grant_store is mandatory for the grant
+    @test_throws ArgumentError TokenEndpointConfig(
+        code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+        client_authenticator = (req, p) -> TokenEndpointClient("c1"),
+        allowed_grant_types = ["authorization_code", "refresh_token"])
+
+    # authorization_code now hands back a refresh token and records the grant
+    handler, code_store, grant_store = build_endpoint()
+    verifier = generate_pkce_verifier()
+    now_time = Dates.now(UTC)
+    store_authorization_code!(code_store, OAuth.AuthorizationCodeRecord(
+        "code-1", "c1", "https://app/cb", ["read", "write"], "user-1",
+        pkce_challenge(verifier), "S256", now_time, now_time + Dates.Hour(1),
+        nothing, ["https://api.example"], Dict{String,Any}()))
+    resp = handler(form_request("grant_type=authorization_code&code=code-1&redirect_uri=$(HTTP.escapeuri("https://app/cb"))&code_verifier=$(verifier.verifier)"))
+    @test resp.status == 200
+    body = JSON.parse(String(resp.body))
+    refresh = body["refresh_token"]
+    @test refresh isa String && !isempty(refresh)
+    @test lookup_refresh_token_grant(grant_store, refresh) !== nothing
+
+    # redeeming it mints a new access token carrying the original subject/scope
+    resp2 = handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(refresh))"))
+    @test resp2.status == 200
+    body2 = JSON.parse(String(resp2.body))
+    claims = validate_jwt_access_token(body2["access_token"], validator)
+    @test claims.subject == "user-1"
+    @test sort(claims.scope) == ["read", "write"]
+    @test body2["resource"] == ["https://api.example"]
+
+    # tokens are rotated: a new one is returned and the old one no longer works
+    rotated = body2["refresh_token"]
+    @test rotated != refresh
+    replay = handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(refresh))"))
+    @test replay.status == 400
+    @test JSON.parse(String(replay.body))["error"] == "invalid_grant"
+    @test handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(rotated))")).status == 200
+
+    # unknown tokens and missing parameters
+    @test JSON.parse(String(handler(form_request("grant_type=refresh_token&refresh_token=nope")).body))["error"] == "invalid_grant"
+    @test JSON.parse(String(handler(form_request("grant_type=refresh_token")).body))["error"] == "invalid_request"
+
+    # scope may be narrowed but never widened (RFC 6749 Section 6)
+    handler2, code_store2, grant_store2 = build_endpoint()
+    store_refresh_token_grant!(grant_store2, OAuth.RefreshTokenGrantRecord(
+        "rt-scope", "c1", "user-2", ["read", "write"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    narrowed = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope&scope=read"))
+    @test narrowed.status == 200
+    narrowed_body = JSON.parse(String(narrowed.body))
+    @test narrowed_body["scope"] == "read"
+    @test sort(lookup_refresh_token_grant(grant_store2, narrowed_body["refresh_token"]).scope) == ["read", "write"]
+    store_refresh_token_grant!(grant_store2, OAuth.RefreshTokenGrantRecord(
+        "rt-scope2", "c1", "user-2", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    widened = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope2&scope=read+admin"))
+    @test widened.status == 400
+    @test JSON.parse(String(widened.body))["error"] == "invalid_scope"
+    @test lookup_refresh_token_grant(grant_store2, "rt-scope2") !== nothing
+
+    # a refresh token is bound to the client it was issued to
+    handler3, _, grant_store3 = build_endpoint()
+    store_refresh_token_grant!(grant_store3, OAuth.RefreshTokenGrantRecord(
+        "rt-other", "other-client", "user-3", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    mismatched = handler3(form_request("grant_type=refresh_token&refresh_token=rt-other"))
+    @test mismatched.status == 400
+    @test JSON.parse(String(mismatched.body))["error"] == "invalid_grant"
+    @test lookup_refresh_token_grant(grant_store3, "rt-other") !== nothing
+
+    # expiry is enforced
+    handler4, _, grant_store4 = build_endpoint(ttl = 3600)
+    past = now_time - Dates.Hour(2)
+    store_refresh_token_grant!(grant_store4, OAuth.RefreshTokenGrantRecord(
+        "rt-expired", "c1", "user-4", ["read"], String[], nothing,
+        Dict{String,Any}(), past, past + Dates.Minute(1)); now = past)
+    expired = handler4(form_request("grant_type=refresh_token&refresh_token=rt-expired"))
+    @test expired.status == 400
+    @test JSON.parse(String(expired.body))["error"] == "invalid_grant"
+    @test lookup_refresh_token_grant(grant_store4, "rt-expired") === nothing
+
+    # without the grant in allowed_grant_types the endpoint still refuses it
+    plain_cfg = TokenEndpointConfig(
+        code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+        client_authenticator = (req, p) -> TokenEndpointClient("c1"; public = true))
+    plain = build_token_endpoint(plain_cfg)
+    resp_unsupported = plain(form_request("grant_type=refresh_token&refresh_token=x"))
+    @test JSON.parse(String(resp_unsupported.body))["error"] == "unsupported_grant_type"
 end
 
 @testset "take_with_timeout does not discard a late redirect" begin

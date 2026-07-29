@@ -56,6 +56,8 @@ export load_refresh_token, save_refresh_token!, clear_refresh_token!
 export AuthorizationEndpointConfig, TokenEndpointConfig, TokenEndpointClient
 export AuthorizationRequestContext, AuthorizationGrantDecision, grant_authorization, deny_authorization
 export AuthorizationCodeStore, AuthorizationCodeRecord, InMemoryAuthorizationCodeStore
+export RefreshTokenGrantStore, RefreshTokenGrantRecord, InMemoryRefreshTokenGrantStore
+export store_refresh_token_grant!, consume_refresh_token_grant!, lookup_refresh_token_grant
 export build_authorization_endpoint, build_token_endpoint, client_credentials_authenticator
 export store_authorization_code!, consume_authorization_code!
 

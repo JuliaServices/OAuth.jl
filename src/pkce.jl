@@ -34,6 +34,16 @@ function within_pkce_length(verifier)
     return PKCE_VERIFIER_MIN <= len <= PKCE_VERIFIER_MAX
 end
 
+function valid_pkce_value(value::AbstractString)
+    within_pkce_length(value) || return false
+    return all(codeunits(value)) do byte
+        (UInt8('A') <= byte <= UInt8('Z')) ||
+        (UInt8('a') <= byte <= UInt8('z')) ||
+        (UInt8('0') <= byte <= UInt8('9')) ||
+        byte in (UInt8('-'), UInt8('.'), UInt8('_'), UInt8('~'))
+    end
+end
+
 pkce_challenge(input::PKCEVerifier) = pkce_challenge(input.verifier)
 
 """
@@ -54,7 +64,7 @@ julia> challenge = pkce_challenge(verifier)
 ```
 """
 function pkce_challenge(verifier::AbstractString)
-    within_pkce_length(String(verifier)) || throw(ArgumentError("Invalid PKCE verifier length"))
+    valid_pkce_value(verifier) || throw(ArgumentError("Invalid PKCE verifier"))
     digest = SHA.sha256(codeunits(verifier))
     return base64url(digest)
 end

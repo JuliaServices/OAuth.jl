@@ -20,6 +20,57 @@ julia> ] add OAuth
 
 OAuth.jl is tested against Julia `1.10` and newer.
 
+## ⚠️ Upgrading to 3.0
+
+3.0 tightens several defaults in the secure direction and fixes a specification bug that
+affected interoperability. Read this before upgrading a deployed service.
+
+**1. DPoP key thumbprints (`jkt`) change value.** `jwk_thumbprint` now follows RFC 7638 §3.2
+and digests only the required members for the key type. Previously *every* member was
+hashed, so a JWK carrying the standard optional `kid`/`alg`/`use` members — which is what
+most clients publish, and what OAuth.jl's own `public_jwk` emits — produced a thumbprint no
+specification-compliant peer would agree with. If you issued DPoP-bound (`cnf.jkt`) access
+tokens with an earlier version, **their confirmation values are now stale and will fail
+verification**; re-issue them. If you were talking to a third-party authorization server,
+DPoP was already broken and now works.
+
+**2. PKCE is required at the authorization endpoint, `S256` only.** `build_authorization_endpoint`
+previously issued codes for requests with no `code_challenge` at all, and silently accepted
+the `plain` method, despite its docstring claiming to enforce PKCE. Requests without a
+challenge, or using `plain`, are now redirected back with `error=invalid_request`. To keep
+the old behaviour for legacy clients:
+
+```julia
+AuthorizationEndpointConfig(
+    code_store = code_store,
+    redirect_uri_resolver = resolver,
+    consent_handler = consent,
+    require_pkce = false,
+    allowed_code_challenge_methods = ["S256", "plain"],
+)
+```
+
+**3. Introspection and revocation endpoints require an explicit `authenticator`.** These
+previously defaulted to `AllowAllAuthenticator()`, silently leaving them open to anyone who
+could reach them — an open introspection endpoint lets an attacker test captured tokens, and
+an open revocation endpoint lets anyone revoke any token they can name. Both RFC 7662 §2.1
+and RFC 7009 §2.1 require client authentication. Omitting the argument is now an
+`ArgumentError`, so you have to choose:
+
+```julia
+build_introspection_handler(store; authenticator = BasicCredentialsAuthenticator(credentials = creds))
+build_revocation_handler(store; authenticator = AllowAllAuthenticator())  # explicit opt-out
+```
+
+**4. `TokenEndpointConfig` rejects grant types the endpoint cannot serve.** Passing something
+like `["client_credentials"]` used to be accepted and then answered with
+`unsupported_grant_type` on every request; it now throws at construction.
+
+**New in 3.0:** the built-in token endpoint implements the `refresh_token` grant (see
+[Token Endpoint Helpers](#token-endpoint-helpers)), client secrets and PKCE verifiers are
+compared in constant time, malformed access tokens produce `401` instead of an unhandled
+`500`, and `JWTAccessTokenIssuer` can finally derive an EC public JWK on its own.
+
 ## Contents
 
 - [Client](#client)
@@ -381,6 +432,18 @@ HTTP.register!(router, "GET", "/authorize", auth_endpoint)
 
 `AuthorizationRequestContext` contains the normalized request (client ID, redirect URI, scope/resource arrays, PKCE code challenge/method, and arbitrary params), so your consent handler can add custom claims or deny requests with helpful messages via `deny_authorization`.
 
+PKCE is required by default, and only the `S256` challenge method is accepted, matching the OAuth 2.0 Security BCP (RFC 9700) and OAuth 2.1. Requests without a `code_challenge`, or using `plain`, are redirected back with `error=invalid_request`. If you must support legacy clients, opt out explicitly:
+
+```julia
+AuthorizationEndpointConfig(
+    code_store = code_store,
+    redirect_uri_resolver = resolver,
+    consent_handler = consent,
+    require_pkce = false,                              # allow requests with no code_challenge
+    allowed_code_challenge_methods = ["S256", "plain"], # accept the plain method too
+)
+```
+
 ### Token Endpoint Helpers
 
 The token endpoint builder consumes the authorization codes created above, issues JWTs, saves them to your store, and optionally returns refresh tokens. Bring your client-store map as an authenticator.
@@ -402,11 +465,29 @@ token_endpoint = build_token_endpoint(
 HTTP.register!(router, "POST", "/token", token_endpoint)
 ```
 
-You receive a `TokenEndpointClient` describing the authenticated client, and the helper automatically enforces PKCE (plain vs `S256`), validates redirect URIs, and copies authorization details/resource indicators into the response.
+You receive a `TokenEndpointClient` describing the authenticated client, and the helper automatically enforces PKCE, validates redirect URIs, and copies authorization details/resource indicators into the response.
+
+To also serve the `refresh_token` grant, add it to `allowed_grant_types` and supply a `refresh_grant_store`. The endpoint then issues a refresh token alongside each access token, remembers what it was granted for, and honours it later:
+
+```julia
+token_endpoint = build_token_endpoint(
+    TokenEndpointConfig(
+        code_store = code_store,
+        token_issuer = token_issuer,
+        client_authenticator = client_auth,
+        token_store = token_store,
+        allowed_grant_types = ["authorization_code", "refresh_token"],
+        refresh_grant_store = InMemoryRefreshTokenGrantStore(),
+        refresh_token_ttl_seconds = 60 * 60 * 24 * 30,  # optional; `nothing` means no expiry
+    ),
+)
+```
+
+Refresh tokens are **rotated on every use**: redeeming one consumes it and returns a fresh token, so a replayed token fails with `invalid_grant` (RFC 9700 §4.14). The grant is bound to the client it was issued to, honours the configured TTL, and lets clients narrow scope but never widen it (RFC 6749 §6). Supply `refresh_token_generator` if you want to mint the token values yourself; the default draws 32 CSPRNG bytes.
 
 ### Introspection & Revocation
 
-OAuth.jl exposes ready-to-mount handlers for RFC 7662 introspection and RFC 7009 revocation. Protect them with either the default `AllowAllAuthenticator` or HTTP Basic credentials.
+OAuth.jl exposes ready-to-mount handlers for RFC 7662 introspection and RFC 7009 revocation. Both **require** an explicit `authenticator` — leaving one of these endpoints open lets anyone test captured tokens or revoke tokens they can name, so the choice is deliberate rather than a default. Pass HTTP Basic credentials, or `AllowAllAuthenticator()` to opt out for tests and localhost.
 
 ```julia
 introspect_auth = BasicCredentialsAuthenticator(
