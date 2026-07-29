@@ -1431,6 +1431,28 @@ function dispatch_loopback_callback(url::AbstractString; attempts::Integer=60, d
     error("Failed to send loopback callback request after $(attempts) attempts: $(last_error)")
 end
 
+# The first real HTTP.get in a process must compile HTTP.jl's entire request
+# pipeline. Under the flags julia-actions/julia-runtest uses (--check-bounds=yes,
+# which invalidates precompiled native code) that takes ~16s, which is longer than
+# the callback timeouts below allow - so the loopback tests timed out on CI while
+# passing locally. Warm the client stack once, outside any timed section.
+function warmup_http_client()
+    port = free_port()
+    router = HTTP.Router()
+    HTTP.register!(router, "GET", "/warmup", _ -> HTTP.Response(200, "ok"))
+    server = HTTP.serve!(router, DEFAULT_LOOPBACK_HOST, port)
+    try
+        HTTP.get("http://$(DEFAULT_LOOPBACK_HOST):$(port)/warmup"; status_exception=false, retry=false)
+    catch err
+        @warn "HTTP client warmup failed; loopback tests may be slow to start" err
+    finally
+        close(server)
+    end
+    return nothing
+end
+
+warmup_http_client()
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(
@@ -1987,6 +2009,38 @@ end
         @test resp.status == 401
     end
 
+    # Valid signatures over malformed claim types are still untrusted input.
+    now_seconds = Int(floor(Dates.datetime2unix(Dates.now(UTC))))
+    base_claims = Dict{String,Any}(
+        "iss" => "https://as.example",
+        "aud" => "https://api.example",
+        "iat" => now_seconds,
+        "exp" => now_seconds + 300,
+    )
+    malformed_claims = [
+        "aud" => Any[Dict("unexpected" => true)],
+        "scope" => Any["read", 42],
+        "sub" => Dict("unexpected" => true),
+        "nbf" => "later",
+        "cnf" => "not-an-object",
+    ]
+    for (name, value) in malformed_claims
+        payload = merge(base_claims, Dict{String,Any}(name => value))
+        token = OAuth.build_jws_compact(
+            Dict{String,Any}("alg" => "RS256", "kid" => "k1"),
+            payload,
+            issuer.signer,
+            :RS256,
+        )
+        @test_throws OAuthError validate_jwt_access_token(token, validator)
+        req = HTTP.Request("GET", "/data", ["Authorization" => "Bearer $token"])
+        @test middleware(req).status == 401
+    end
+
+    valid = issue_access_token(issuer; subject = "user-1")
+    wrong_scheme = HTTP.Request("GET", "/data", ["Authorization" => "Basic $(valid.token)"])
+    @test middleware(wrong_scheme).status == 401
+
     # a JWKS entry without kty is a configuration error, not a KeyError
     @test_throws ArgumentError TokenValidationConfig(
         issuer = "https://as.example", audience = ["x"], jwks = Dict("keys" => [Dict("kid" => "a")]))
@@ -2004,6 +2058,23 @@ end
     @test creds("") === nothing
     @test creds("Bearer") === nothing
     @test creds("Bearer ") === nothing
+
+    # Authentication schemes are case-insensitive. OAuth client credentials
+    # additionally use application/x-www-form-urlencoded encoding before Base64.
+    endpoint_auth = client_credentials_authenticator(Dict("client name" => "s:cret"))
+    encoded = Base64.base64encode("client+name:s%3Acret")
+    client = endpoint_auth(
+        HTTP.Request("POST", "/token", ["Authorization" => "basic $encoded"]),
+        Dict{String,String}(),
+    )
+    @test client.client_id == "client name"
+    management_auth = BasicCredentialsAuthenticator(credentials = Dict("client" => "secret"))
+    management_req = HTTP.Request(
+        "POST",
+        "/introspect",
+        ["Authorization" => "bAsIc $(Base64.base64encode("client:secret"))"],
+    )
+    @test OAuth.authenticate_request(management_auth, management_req)
 end
 
 @testset "Authorization endpoint PKCE enforcement" begin
@@ -2041,8 +2112,12 @@ end
         require_pkce = false, allowed_code_challenge_methods = ["S256", "plain"]))
     resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code"))
     @test occursin("code=", location_of(resp))
-    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=abc"))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(verifier.verifier)"))
     @test occursin("code=", location_of(resp))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(repeat("a", 42))"))
+    @test occursin("error=invalid_request", location_of(resp))
+    resp = lax(HTTP.Request("GET", "/authorize?client_id=c1&response_type=code&code_challenge=$(repeat("a", 42))%21"))
+    @test occursin("error=invalid_request", location_of(resp))
 
     @test_throws ArgumentError AuthorizationEndpointConfig(
         code_store = store, redirect_uri_resolver = resolver, consent_handler = consent,
@@ -2099,15 +2174,16 @@ end
     @test "authorization_code" in cfg.allowed_grant_types
 end
 
-@testset "select_authorization_server issuer normalization" begin
+@testset "select_authorization_server exact issuer matching" begin
     metadata = ProtectedResourceMetadata(JSON.parse("""{"authorization_servers":["https://idp.example"]}"""))
     @test select_authorization_server(metadata) == "https://idp.example"
     @test select_authorization_server(metadata; issuer = "https://idp.example") == "https://idp.example"
-    @test select_authorization_server(metadata; issuer = "https://idp.example/") == "https://idp.example"
+    @test_throws OAuthError select_authorization_server(metadata; issuer = "https://idp.example/")
     @test_throws OAuthError select_authorization_server(metadata; issuer = "https://other.example")
 
     trailing = ProtectedResourceMetadata(JSON.parse("""{"authorization_servers":["https://idp.example/"]}"""))
-    @test select_authorization_server(trailing; issuer = "https://idp.example") == "https://idp.example/"
+    @test select_authorization_server(trailing; issuer = "https://idp.example/") == "https://idp.example/"
+    @test_throws OAuthError select_authorization_server(trailing; issuer = "https://idp.example")
 end
 
 @testset "DPoP end-to-end with decorated JWK" begin
@@ -2170,6 +2246,22 @@ end
     resp = middleware(leaky_req)
     @test resp.status == 401
     @test occursin("private key material", OAuth.header_value(resp.headers, "WWW-Authenticate", ""))
+
+    malformed_headers = [
+        Dict{String,Any}("typ" => 42, "jwk" => bare_jwk),
+        Dict{String,Any}("typ" => "dpop+jwt", "jwk" => merge(bare_jwk, Dict{String,Any}("x" => "%%%"))),
+        Dict{String,Any}("typ" => "dpop+jwt", "jwk" => merge(bare_jwk, Dict{String,Any}("kty" => 42))),
+    ]
+    for malformed_header in malformed_headers
+        malformed_proof = OAuth.build_jws_compact(malformed_header, leaky_payload, ec_signer, :ES256)
+        malformed_req = HTTP.Request(
+            "GET",
+            "/resource",
+            ["Authorization" => "DPoP $(token.token)", "DPoP" => malformed_proof],
+            "",
+        )
+        @test middleware(malformed_req).status == 401
+    end
 end
 
 @testset "Management endpoints require an explicit authenticator" begin
@@ -2267,13 +2359,16 @@ end
         Dict{String,Any}(), now_time, nothing))
     narrowed = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope&scope=read"))
     @test narrowed.status == 200
-    @test JSON.parse(String(narrowed.body))["scope"] == "read"
+    narrowed_body = JSON.parse(String(narrowed.body))
+    @test narrowed_body["scope"] == "read"
+    @test sort(lookup_refresh_token_grant(grant_store2, narrowed_body["refresh_token"]).scope) == ["read", "write"]
     store_refresh_token_grant!(grant_store2, OAuth.RefreshTokenGrantRecord(
         "rt-scope2", "c1", "user-2", ["read"], String[], nothing,
         Dict{String,Any}(), now_time, nothing))
     widened = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope2&scope=read+admin"))
     @test widened.status == 400
     @test JSON.parse(String(widened.body))["error"] == "invalid_scope"
+    @test lookup_refresh_token_grant(grant_store2, "rt-scope2") !== nothing
 
     # a refresh token is bound to the client it was issued to
     handler3, _, grant_store3 = build_endpoint()
@@ -2283,6 +2378,7 @@ end
     mismatched = handler3(form_request("grant_type=refresh_token&refresh_token=rt-other"))
     @test mismatched.status == 400
     @test JSON.parse(String(mismatched.body))["error"] == "invalid_grant"
+    @test lookup_refresh_token_grant(grant_store3, "rt-other") !== nothing
 
     # expiry is enforced
     handler4, _, grant_store4 = build_endpoint(ttl = 3600)
@@ -2293,6 +2389,7 @@ end
     expired = handler4(form_request("grant_type=refresh_token&refresh_token=rt-expired"))
     @test expired.status == 400
     @test JSON.parse(String(expired.body))["error"] == "invalid_grant"
+    @test lookup_refresh_token_grant(grant_store4, "rt-expired") === nothing
 
     # without the grant in allowed_grant_types the endpoint still refuses it
     plain_cfg = TokenEndpointConfig(
@@ -2335,3 +2432,19 @@ end
 end
 
 include("trim_compile_tests.jl")
+
+@testset "take_with_timeout does not discard a late redirect" begin
+    # A redirect that lands while this task is descheduled (e.g. another task held
+    # the thread) must still be returned rather than reported as a timeout.
+    channel = Channel{OAuth.StringParams}(1)
+    params = OAuth.StringParams("code" => "abc", "state" => "s")
+    put!(channel, params)
+    @test OAuth.take_with_timeout(channel, 0) == params
+
+    empty_channel = Channel{OAuth.StringParams}(1)
+    @test_throws OAuthError OAuth.take_with_timeout(empty_channel, 0)
+
+    delivered = Channel{OAuth.StringParams}(1)
+    @async (sleep(0.2); put!(delivered, params))
+    @test OAuth.take_with_timeout(delivered, 5) == params
+end

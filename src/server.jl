@@ -1063,9 +1063,9 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
         normalized[String(k)] = String(v)
     end
     function authenticate(req::HTTP.Request, params::Dict{String,String})
-        header = header_value(req.headers, "Authorization", "")
-        if startswith(header, "Basic ")
-            encoded = header[7:end]
+        credentials = authorization_credentials(req)
+        if credentials !== nothing && ascii_lc_isequal(credentials.scheme, "basic")
+            encoded = credentials.token
             decoded = try
                 String(Base64.base64decode(encoded))
             catch err
@@ -1073,8 +1073,16 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
             end
             idx = findfirst(==(':'), decoded)
             idx === nothing && throw(OAuthError(:invalid_client, "Invalid Authorization credentials"))
-            username = decoded[1:idx-1]
-            password = decoded[idx+1:end]
+            username = try
+                decode_form_component(decoded[1:idx-1], "client_id")
+            catch err
+                throw(OAuthError(:invalid_client, err.message))
+            end
+            password = try
+                decode_form_component(decoded[idx+1:end], "client_secret")
+            catch err
+                throw(OAuthError(:invalid_client, err.message))
+            end
             expected = get(normalized, username, nothing)
             expected === nothing && throw(OAuthError(:invalid_client, "Unknown client"))
             secure_compare(password, expected) || throw(OAuthError(:invalid_client, "Invalid client secret"))
@@ -1181,6 +1189,11 @@ function build_authorization_endpoint(config::AuthorizationEndpointConfig)
         else
             code_challenge_method in config.allowed_code_challenge_methods ||
                 return authorization_redirect_response(redirect_uri, state_value, ["error" => "invalid_request", "error_description" => "Unsupported code_challenge_method $(code_challenge_method)"])
+            challenge = String(code_challenge)
+            valid_pkce_value(challenge) ||
+                return authorization_redirect_response(redirect_uri, state_value, ["error" => "invalid_request", "error_description" => "Invalid code_challenge"])
+            code_challenge_method == "S256" && ncodeunits(challenge) != 43 &&
+                return authorization_redirect_response(redirect_uri, state_value, ["error" => "invalid_request", "error_description" => "Invalid S256 code_challenge"])
         end
         resources = get(multi, "resource", nothing)
         resource_values = resources === nothing ? String[] : [String(r) for r in resources if !isempty(r)]
@@ -1381,11 +1394,11 @@ function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Reque
         end
     end
     client isa TokenEndpointClient || throw(ArgumentError("client_authenticator must return TokenEndpointClient"))
-    # consuming the token rotates it: a replayed refresh token is simply absent
-    record = consume_refresh_token_grant!(store, token_value)
+    record = lookup_refresh_token_grant(store, token_value)
     record === nothing && return token_error_response("invalid_grant", "refresh token is invalid or has already been used")
     now_time = Dates.now(UTC)
     if record.expires_at !== nothing && now_time > record.expires_at
+        consume_refresh_token_grant!(store, token_value)
         return token_error_response("invalid_grant", "refresh token expired")
     end
     record.client_id == client.client_id || return token_error_response("invalid_grant", "refresh token was issued to a different client")
@@ -1398,6 +1411,10 @@ function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Reque
         isempty(extra) || return token_error_response("invalid_scope", "Requested scope exceeds the original grant: $(join(sort(extra), ", "))")
         granted_scope = requested_scope
     end
+    # Consume only after all request-specific validation succeeds. This keeps a
+    # wrong-client or invalid-scope request from invalidating a legitimate grant.
+    record = consume_refresh_token_grant!(store, token_value)
+    record === nothing && return token_error_response("invalid_grant", "refresh token is invalid or has already been used")
     extra_claims = Dict{String,Any}()
     for (k, v) in record.extra_claims
         extra_claims[String(k)] = v
@@ -1427,7 +1444,7 @@ function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Reque
     new_refresh = config.refresh_token_generator(record, client)
     if new_refresh !== nothing
         response["refresh_token"] = String(new_refresh)
-        persist_refresh_grant!(config, String(new_refresh), record.client_id, record.subject, granted_scope, record.resource, record.authorization_details, record.extra_claims, now_time)
+        persist_refresh_grant!(config, String(new_refresh), record.client_id, record.subject, record.scope, record.resource, record.authorization_details, record.extra_claims, now_time)
     end
     return token_success_response(response)
 end
@@ -1509,9 +1526,11 @@ end
 
 authenticate_request(::AllowAllAuthenticator, _req::HTTP.Request) = true
 function authenticate_request(auth::BasicCredentialsAuthenticator, req::HTTP.Request)
-    header = header_value(req.headers, "Authorization", "")
-    startswith(header, "Basic ") || return false
-    encoded = header[7:end]
+    credentials = authorization_credentials(req)
+    if credentials === nothing || !ascii_lc_isequal(credentials.scheme, "basic")
+        return false
+    end
+    encoded = credentials.token
     decoded = try
         String(Base64.base64decode(encoded))
     catch
@@ -1688,11 +1707,13 @@ end
 
 function parse_audience(value)
     if value isa AbstractVector
+        all(v -> v isa AbstractString, value) ||
+            throw(OAuthError(:invalid_token, "aud claim must contain only strings"))
         return [String(v) for v in value]
     elseif value isa AbstractString
         return [String(value)]
     else
-        return String[]
+        throw(OAuthError(:invalid_token, "aud claim must be a string or array of strings"))
     end
 end
 
@@ -1702,11 +1723,21 @@ function parse_scope_claim(payload)
         if value isa AbstractString
             return split(String(value))
         elseif value isa AbstractVector
+            all(v -> v isa AbstractString, value) ||
+                throw(OAuthError(:invalid_token, "scope claim must contain only strings"))
             return [String(v) for v in value]
         end
+        throw(OAuthError(:invalid_token, "scope claim must be a string or array of strings"))
     elseif haskey(payload, "scp")
         value = payload["scp"]
-        value isa AbstractVector && return [String(v) for v in value]
+        if value isa AbstractString
+            return split(String(value))
+        elseif value isa AbstractVector
+            all(v -> v isa AbstractString, value) ||
+                throw(OAuthError(:invalid_token, "scp claim must contain only strings"))
+            return [String(v) for v in value]
+        end
+        throw(OAuthError(:invalid_token, "scp claim must be a string or array of strings"))
     end
     return String[]
 end
@@ -1714,11 +1745,18 @@ end
 function extract_confirmation_thumbprint(payload)
     haskey(payload, "cnf") || return nothing
     cnf = payload["cnf"]
-    if cnf isa AbstractDict
-        value = get(cnf, "jkt", nothing)
-        return value isa AbstractString ? String(value) : nothing
-    end
-    return nothing
+    cnf isa AbstractDict || throw(OAuthError(:invalid_token, "cnf claim must be an object"))
+    value = get(cnf, "jkt", nothing)
+    value === nothing && return nothing
+    value isa AbstractString || throw(OAuthError(:invalid_token, "cnf.jkt claim must be a string"))
+    return String(value)
+end
+
+function optional_string_claim(payload, name::AbstractString)
+    haskey(payload, name) || return nothing
+    value = payload[name]
+    value isa AbstractString || throw(OAuthError(:invalid_token, "$(name) claim must be a string"))
+    return String(value)
 end
 
 function parse_numeric_claim(value::Bool)
@@ -1761,8 +1799,10 @@ function validate_jwt_access_token(token::AbstractString, config::TokenValidatio
     expires_at === nothing && throw(OAuthError(:invalid_token, "Missing exp"))
     now > expires_at + config.leeway && throw(OAuthError(:invalid_token, "Token expired"))
     nbf = haskey(payload, "nbf") ? parse_numeric_claim(payload["nbf"]) : nothing
+    haskey(payload, "nbf") && nbf === nothing && throw(OAuthError(:invalid_token, "nbf claim must be numeric"))
     nbf !== nothing && now + config.leeway < nbf && throw(OAuthError(:invalid_token, "Token not yet valid"))
     issued_at = haskey(payload, "iat") ? parse_numeric_claim(payload["iat"]) : nothing
+    haskey(payload, "iat") && issued_at === nothing && throw(OAuthError(:invalid_token, "iat claim must be numeric"))
     issued_at !== nothing && issued_at - config.leeway > now && throw(OAuthError(:invalid_token, "Token issued in the future"))
     aud_claim = parse_audience(get(payload, "aud", String[]))
     if !isempty(config.audience)
@@ -1780,8 +1820,8 @@ function validate_jwt_access_token(token::AbstractString, config::TokenValidatio
     end
     return AccessTokenClaims(
         token = String(token),
-        subject = haskey(payload, "sub") ? String(payload["sub"]) : nothing,
-        client_id = haskey(payload, "client_id") ? String(payload["client_id"]) : (haskey(payload, "azp") ? String(payload["azp"]) : nothing),
+        subject = optional_string_claim(payload, "sub"),
+        client_id = haskey(payload, "client_id") ? optional_string_claim(payload, "client_id") : optional_string_claim(payload, "azp"),
         scope = scope_claims,
         audience = aud_claim,
         expires_at = expires_at,
@@ -1849,7 +1889,9 @@ function normalized_request_url(req::HTTP.Request, origin::ResourceOrigin)
 end
 
 function build_dpop_verifier_from_jwk(jwk::Dict{String,Any}, alg::Symbol)
-    kty = uppercase(String(get(jwk, "kty", "")))
+    kty_value = get(jwk, "kty", nothing)
+    kty_value isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing key type"))
+    kty = uppercase(String(kty_value))
     if kty == "EC"
         crv = get(jwk, "crv", nothing)
         crv isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing EC curve"))
@@ -1859,18 +1901,28 @@ function build_dpop_verifier_from_jwk(jwk::Dict{String,Any}, alg::Symbol)
         y_val = get(jwk, "y", nothing)
         x_val isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing EC x coordinate"))
         y_val isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing EC y coordinate"))
-        x_bytes = Vector{UInt8}(base64urldecode(String(x_val)))
-        y_bytes = Vector{UInt8}(base64urldecode(String(y_val)))
-        return ecc_verifier_from_coordinates(x_bytes, y_bytes, curve_symbol)
+        return try
+            x_bytes = Vector{UInt8}(base64urldecode(String(x_val)))
+            y_bytes = Vector{UInt8}(base64urldecode(String(y_val)))
+            ecc_verifier_from_coordinates(x_bytes, y_bytes, curve_symbol)
+        catch err
+            err isa OAuthError && rethrow()
+            throw(OAuthError(:invalid_token, "Invalid DPoP EC key: $(err)"))
+        end
     elseif kty == "RSA"
         alg in SUPPORTED_RSA_ALGS || throw(OAuthError(:invalid_token, "Unsupported DPoP alg $(alg) for RSA key"))
         n_val = get(jwk, "n", nothing)
         e_val = get(jwk, "e", nothing)
         n_val isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing RSA modulus"))
         e_val isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing RSA exponent"))
-        n_bytes = Vector{UInt8}(base64urldecode(String(n_val)))
-        e_bytes = Vector{UInt8}(base64urldecode(String(e_val)))
-        return rsa_verifier_from_components(n_bytes, e_bytes)
+        return try
+            n_bytes = Vector{UInt8}(base64urldecode(String(n_val)))
+            e_bytes = Vector{UInt8}(base64urldecode(String(e_val)))
+            rsa_verifier_from_components(n_bytes, e_bytes)
+        catch err
+            err isa OAuthError && rethrow()
+            throw(OAuthError(:invalid_token, "Invalid DPoP RSA key: $(err)"))
+        end
     else
         throw(OAuthError(:invalid_token, "Unsupported DPoP key type $(kty)"))
     end
@@ -1888,7 +1940,9 @@ function verify_dpop_proof(
     nonce_validator,
 )
     header, payload, signature, signing_input = decode_compact_jwt(proof)
-    typ = lowercase(String(get(header, "typ", "")))
+    typ_value = get(header, "typ", nothing)
+    typ_value isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof typ must be a string"))
+    typ = lowercase(String(typ_value))
     typ == "dpop+jwt" || throw(OAuthError(:invalid_token, "Invalid DPoP proof typ"))
     jwk_value = get(header, "jwk", nothing)
     jwk_value isa AbstractDict || throw(OAuthError(:invalid_token, "DPoP proof missing jwk"))
@@ -1898,10 +1952,16 @@ function verify_dpop_proof(
     end
     # RFC 9449 Section 4.3: the embedded jwk must be a public key only
     jwk_has_private_material(jwk) && throw(OAuthError(:invalid_token, "DPoP proof jwk must not contain private key material"))
-    alg_value = Symbol(uppercase(String(get(header, "alg", ""))))
+    alg_header = get(header, "alg", nothing)
+    alg_header isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof alg must be a string"))
+    alg_value = Symbol(uppercase(String(alg_header)))
     verifier = build_dpop_verifier_from_jwk(jwk, alg_value)
     verify_jws(verifier, alg_value, signing_input, signature) || throw(OAuthError(:invalid_token, "Invalid DPoP proof signature"))
-    thumbprint = jwk_thumbprint(jwk)
+    thumbprint = try
+        jwk_thumbprint(jwk)
+    catch err
+        throw(OAuthError(:invalid_token, "Invalid DPoP jwk: $(err)"))
+    end
     claims.confirmation_jkt === nothing && throw(OAuthError(:invalid_token, "Token is not sender constrained"))
     secure_compare(thumbprint, claims.confirmation_jkt) || throw(OAuthError(:invalid_token, "DPoP key thumbprint mismatch"))
     expected_htu = normalized_request_url(req, origin)
@@ -1982,6 +2042,9 @@ function protected_resource_middleware(
     function middleware(req::HTTP.Request)
         creds = authorization_credentials(req)
         creds === nothing && return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes, error_code="invalid_token", error_description="Missing access token")
+        scheme_lc = lowercase(creds.scheme)
+        scheme_lc in ("bearer", "dpop") ||
+            return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes, error_code="invalid_token", error_description="Unsupported Authorization scheme")
         claims = try
             validate_jwt_access_token(creds.token, validator; required_scopes=scopes)
         catch err
@@ -1994,7 +2057,6 @@ function protected_resource_middleware(
             end
         end
         confirmation = claims.confirmation_jkt
-        scheme_lc = lowercase(creds.scheme)
         if confirmation !== nothing
             if scheme_lc != "dpop"
                 return unauthorized_response(resource_metadata_url; realm=realm, required_scopes=scopes, error_code="invalid_token", error_description="DPoP tokens must use the DPoP Authorization scheme")

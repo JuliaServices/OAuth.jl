@@ -507,11 +507,14 @@ end
 
 function take_with_timeout(channel::Channel, timeout::Real)
     deadline = time() + timeout
-    while time() <= deadline
-        if isready(channel)
-            return take!(channel)
-        end
+    while true
+        isready(channel) && return take!(channel)
+        time() > deadline && break
         sleep(0.05)
     end
+    # The redirect may have landed while this task was descheduled - for example
+    # while another task held the thread - so check once more before giving up
+    # rather than discarding an authorization code we actually received.
+    isready(channel) && return take!(channel)
     throw(OAuthError(:timeout, "Timed out waiting for authorization redirect"))
 end

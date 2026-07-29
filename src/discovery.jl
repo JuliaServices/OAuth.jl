@@ -154,11 +154,8 @@ ERROR: OAuthError(metadata_error): Issuer https://idp2.example not found in reso
 function select_authorization_server(metadata::ProtectedResourceMetadata; issuer::Union{Nothing,AbstractString}=nothing)
     isempty(metadata.authorization_servers) && throw(OAuthError(:metadata_error, "No authorization servers declared by resource"))
     if issuer !== nothing
-        # issuer identifiers are compared without a trailing slash so that
-        # "https://idp.example" and "https://idp.example/" select the same server
-        wanted = strip_trailing_slash(String(issuer))
         for candidate in metadata.authorization_servers
-            strip_trailing_slash(String(candidate)) == wanted && return candidate
+            candidate == issuer && return candidate
         end
         throw(OAuthError(:metadata_error, "Issuer $(issuer) not found in resource metadata"))
     end
