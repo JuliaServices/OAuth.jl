@@ -381,6 +381,18 @@ HTTP.register!(router, "GET", "/authorize", auth_endpoint)
 
 `AuthorizationRequestContext` contains the normalized request (client ID, redirect URI, scope/resource arrays, PKCE code challenge/method, and arbitrary params), so your consent handler can add custom claims or deny requests with helpful messages via `deny_authorization`.
 
+PKCE is required by default, and only the `S256` challenge method is accepted, matching the OAuth 2.0 Security BCP (RFC 9700) and OAuth 2.1. Requests without a `code_challenge`, or using `plain`, are redirected back with `error=invalid_request`. If you must support legacy clients, opt out explicitly:
+
+```julia
+AuthorizationEndpointConfig(
+    code_store = code_store,
+    redirect_uri_resolver = resolver,
+    consent_handler = consent,
+    require_pkce = false,                              # allow requests with no code_challenge
+    allowed_code_challenge_methods = ["S256", "plain"], # accept the plain method too
+)
+```
+
 ### Token Endpoint Helpers
 
 The token endpoint builder consumes the authorization codes created above, issues JWTs, saves them to your store, and optionally returns refresh tokens. Bring your client-store map as an authenticator.

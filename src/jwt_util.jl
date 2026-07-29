@@ -552,16 +552,53 @@ function canonical_json(obj::Dict{String,Any})
     parts = Vector{String}(undef, length(ordered))
     for (i, key) in enumerate(ordered)
         value = obj[key]
-        parts[i] = string("\"", key, "\":", JSON.json(value))
+        parts[i] = string(JSON.json(key), ":", JSON.json(value))
     end
     return "{" * join(parts, ",") * "}"
 end
 
+# RFC 7638 Section 3.2: the thumbprint is computed over *only* the required members
+# for the key type, so optional members (kid, alg, use, x5c, ...) and any private key
+# material must not influence the result.
+const JWK_THUMBPRINT_MEMBERS = Dict(
+    "RSA" => ["e", "kty", "n"],
+    "EC" => ["crv", "kty", "x", "y"],
+    "OKP" => ["crv", "kty", "x"],
+    "OCT" => ["k", "kty"],
+)
+
+"""
+    jwk_thumbprint(jwk) -> String
+
+Compute the RFC 7638 JWK SHA-256 thumbprint, base64url encoded. Only the required
+members for the key type participate in the digest, so a JWK carrying extra members
+such as `kid`, `alg`, or `use` yields the same thumbprint as its bare counterpart.
+"""
 function jwk_thumbprint(jwk::Dict{String,Any})
-    canonical = canonical_json(jwk)
+    kty_value = get(jwk, "kty", nothing)
+    kty_value isa AbstractString || throw(ArgumentError("JWK is missing the required kty member"))
+    kty = uppercase(String(kty_value))
+    members = get(JWK_THUMBPRINT_MEMBERS, kty, nothing)
+    members === nothing && throw(ArgumentError("Unsupported JWK kty for thumbprint: $(kty_value)"))
+    required = Dict{String,Any}()
+    for member in members
+        value = get(jwk, member, nothing)
+        if member == "kty"
+            required[member] = String(kty_value)
+            continue
+        end
+        value isa AbstractString || throw(ArgumentError("JWK is missing required member $(member) for kty=$(kty_value)"))
+        required[member] = String(value)
+    end
+    canonical = canonical_json(required)
     digest = SHA.sha256(codeunits(canonical))
     return base64urlencode(digest)
 end
+
+# RFC 9449 Section 4.3: a DPoP proof's `jwk` header must carry only public key material.
+const JWK_PRIVATE_MEMBERS = ("d", "p", "q", "dp", "dq", "qi", "oth", "k")
+
+jwk_has_private_material(jwk::AbstractDict) = any(member -> haskey(jwk, member), JWK_PRIVATE_MEMBERS)
 
 function build_jws_compact(header::Dict{String,Any}, payload::Dict{String,Any}, signer::JWTSigner, alg::Symbol)
     header["alg"] = String(alg)
@@ -575,12 +612,34 @@ function build_jws_compact(header::Dict{String,Any}, payload::Dict{String,Any}, 
     return string(encoded_header, ".", encoded_payload, ".", encoded_signature)
 end
 
+function decode_jwt_segment(segment::AbstractString, name::AbstractString)
+    return try
+        base64urldecode(segment)
+    catch
+        throw(OAuthError(:invalid_token, "JWT $(name) segment is not valid base64url"))
+    end
+end
+
+function decode_jwt_json_segment(segment::AbstractString, name::AbstractString)
+    bytes = decode_jwt_segment(segment, name)
+    parsed = try
+        JSON.parse(String(bytes))
+    catch
+        throw(OAuthError(:invalid_token, "JWT $(name) segment is not valid JSON"))
+    end
+    parsed isa AbstractDict || throw(OAuthError(:invalid_token, "JWT $(name) segment must be a JSON object"))
+    return parsed
+end
+
+# Decodes a compact JWS. Every malformed-input path raises `OAuthError(:invalid_token, ...)`
+# so that callers (notably `protected_resource_middleware`) can answer with 401 instead of
+# letting an attacker-supplied token surface as an unhandled 500.
 function decode_compact_jwt(token::AbstractString)
     parts = split(String(token), '.')
     length(parts) == 3 || throw(OAuthError(:invalid_token, "JWT must contain three segments"))
-    header = JSON.parse(String(base64urldecode(parts[1])))
-    payload = JSON.parse(String(base64urldecode(parts[2])))
-    signature = base64urldecode(parts[3])
+    header = decode_jwt_json_segment(parts[1], "header")
+    payload = decode_jwt_json_segment(parts[2], "payload")
+    signature = decode_jwt_segment(parts[3], "signature")
     signing_input = Vector{UInt8}(codeunits(string(parts[1], ".", parts[2])))
     return header, payload, signature, signing_input
 end
@@ -635,8 +694,14 @@ publish a JWK or construct a verifier.
 function ecc_public_coordinates(signer::ECSigner)
     x_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
     y_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
-    result = aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
-    result == 0 || error("aws_ecc_key_pair_get_public_key failed with code $(result)")
+    # aws_ecc_key_pair_get_public_key returns void, so the coordinates themselves are
+    # the only success signal available.
+    aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
+    expected = signer.curve == :P256 ? 32 : 48
+    (x_ref[].ptr == C_NULL || y_ref[].ptr == C_NULL) &&
+        error("EC key pair does not expose public key coordinates; provide an explicit public_jwk")
+    (x_ref[].len == expected && y_ref[].len == expected) ||
+        error("Unexpected EC public key coordinate length for curve $(signer.curve): got $(x_ref[].len)/$(y_ref[].len), expected $(expected)")
     x_bytes = unsafe_wrap(Vector{UInt8}, x_ref[].ptr, x_ref[].len; own=false)
     y_bytes = unsafe_wrap(Vector{UInt8}, y_ref[].ptr, y_ref[].len; own=false)
     return copy(x_bytes), copy(y_bytes)

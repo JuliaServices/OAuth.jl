@@ -49,11 +49,15 @@ struct AuthorizationCredentials
 end
 
 function authorization_credentials(req::HTTP.Request)
-    auth = header_value(req.headers, "Authorization", "")
+    auth = strip(header_value(req.headers, "Authorization", ""))
     isempty(auth) && return nothing
-    parts = split(auth, ' ')
+    # RFC 9110 allows one or more spaces between the scheme and the credentials
+    parts = split(auth, ' '; limit=2)
     length(parts) == 2 || return nothing
-    return AuthorizationCredentials(String(parts[1]), String(parts[2]))
+    scheme = String(parts[1])
+    token = String(strip(parts[2]))
+    (isempty(scheme) || isempty(token)) && return nothing
+    return AuthorizationCredentials(scheme, token)
 end
 
 function bearer_token(req::HTTP.Request)
@@ -643,13 +647,25 @@ end
 
 InMemoryTokenStore() = InMemoryTokenStore(ReentrantLock(), Dict{String,AccessTokenRecord}())
 
+function purge_expired_access_tokens!(store::InMemoryTokenStore, now::DateTime)
+    expired = String[]
+    for (token, record) in store.records
+        now > record.expires_at && push!(expired, token)
+    end
+    for token in expired
+        delete!(store.records, token)
+    end
+    return length(expired)
+end
+
 """
-    store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken)
+    store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken; now=Dates.now(UTC))
 
 Persists an issued token into the backing store so later introspection or
-revocation checks can find it.
+revocation checks can find it.  Tokens that expired before `now` are dropped
+on each insert so a long-lived store does not grow without bound.
 """
-function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToken)
+function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToken; now::DateTime=Dates.now(UTC))
     record = AccessTokenRecord(
         issued.token,
         copy(issued.scope),
@@ -662,6 +678,9 @@ function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToke
         issued.confirmation_jkt,
     )
     lock(store.lock) do
+        # expired tokens are never valid for introspection again, so drop them
+        # instead of growing the store without bound
+        purge_expired_access_tokens!(store, now)
         store.records[issued.token] = record
     end
     return record
@@ -730,13 +749,28 @@ end
 
 InMemoryAuthorizationCodeStore() = InMemoryAuthorizationCodeStore(ReentrantLock(), Dict{String,AuthorizationCodeRecord}())
 
-"""
-    store_authorization_code!(store::AuthorizationCodeStore, record)
+function purge_expired_authorization_codes!(store::InMemoryAuthorizationCodeStore, now::DateTime)
+    expired = String[]
+    for (code, record) in store.records
+        now > record.expires_at && push!(expired, code)
+    end
+    for code in expired
+        delete!(store.records, code)
+    end
+    return length(expired)
+end
 
-Persists an authorization code until it is redeemed or expires.
 """
-function store_authorization_code!(store::InMemoryAuthorizationCodeStore, record::AuthorizationCodeRecord)
+    store_authorization_code!(store::AuthorizationCodeStore, record; now=Dates.now(UTC))
+
+Persists an authorization code until it is redeemed or expires.  Codes that
+expired before `now` are dropped on each insert, so codes that are never
+redeemed do not accumulate.
+"""
+function store_authorization_code!(store::InMemoryAuthorizationCodeStore, record::AuthorizationCodeRecord; now::DateTime=Dates.now(UTC))
     lock(store.lock) do
+        # codes that were never redeemed would otherwise accumulate forever
+        purge_expired_authorization_codes!(store, now)
         store.records[record.code] = record
     end
     return record
@@ -833,20 +867,32 @@ struct AuthorizationEndpointConfig{S<:AuthorizationCodeStore,R<:Function,C<:Func
     redirect_uri_resolver::R
     consent_handler::C
     code_ttl::Dates.Second
+    require_pkce::Bool
+    allowed_code_challenge_methods::Set{String}
 end
 
 """
-    AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds=600)
+    AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds=600, require_pkce=true, allowed_code_challenge_methods=["S256"])
 
 Validates inputs and returns a ready-to-use configuration for
 [`build_authorization_endpoint`](@ref).
+
+By default the endpoint requires PKCE and accepts only the `S256` challenge method,
+per the OAuth 2.0 Security BCP (RFC 9700) and OAuth 2.1. Set `require_pkce=false` to
+admit requests without a `code_challenge`, or add `"plain"` to
+`allowed_code_challenge_methods`, only when you must support legacy clients—`plain`
+offers no protection against code interception on the redirect leg.
 """
-function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds::Integer=600)
+function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds::Integer=600, require_pkce::Bool=true, allowed_code_challenge_methods=["S256"])
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
     redirect_uri_resolver isa Function || throw(ArgumentError("redirect_uri_resolver must be callable"))
     consent_handler isa Function || throw(ArgumentError("consent_handler must be callable"))
     code_ttl_seconds > 0 || throw(ArgumentError("code_ttl_seconds must be positive"))
-    return AuthorizationEndpointConfig(code_store, redirect_uri_resolver, consent_handler, Dates.Second(code_ttl_seconds))
+    methods = Set(uppercase(String(m)) for m in allowed_code_challenge_methods)
+    isempty(methods) && throw(ArgumentError("allowed_code_challenge_methods must not be empty"))
+    unsupported = setdiff(methods, Set(["S256", "PLAIN"]))
+    isempty(unsupported) || throw(ArgumentError("Unsupported code_challenge_method(s): $(join(sort(collect(unsupported)), ", "))"))
+    return AuthorizationEndpointConfig(code_store, redirect_uri_resolver, consent_handler, Dates.Second(code_ttl_seconds), require_pkce, methods)
 end
 
 """
@@ -862,6 +908,8 @@ end
 
 """Normalizes inputs before building a `TokenEndpointClient`."""
 TokenEndpointClient(client_id::AbstractString; public::Bool=false) = TokenEndpointClient(String(client_id), Bool(public))
+
+const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code"])
 
 """
     TokenEndpointConfig
@@ -894,6 +942,10 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
     allowed = Set(lowercase.(String.(allowed_grant_types)))
     isempty(allowed) && throw(ArgumentError("allowed_grant_types must not be empty"))
+    # reject grant types the handler cannot serve, rather than accepting them here and
+    # answering every such request with unsupported_grant_type at runtime
+    unsupported = setdiff(allowed, SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES)
+    isempty(unsupported) || throw(ArgumentError("Unsupported grant type(s) for the built-in token endpoint: $(join(sort(collect(unsupported)), ", ")); supported: $(join(sort(collect(SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES)), ", "))"))
     return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed)
 end
 
@@ -925,7 +977,7 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
             password = decoded[idx+1:end]
             expected = get(normalized, username, nothing)
             expected === nothing && throw(OAuthError(:invalid_client, "Unknown client"))
-            password == expected || throw(OAuthError(:invalid_client, "Invalid client secret"))
+            secure_compare(password, expected) || throw(OAuthError(:invalid_client, "Invalid client secret"))
             return TokenEndpointClient(username; public=false)
         end
         client_id = get(params, "client_id", nothing)
@@ -937,7 +989,7 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
         end
         expected = get(normalized, client_id, nothing)
         expected === nothing && throw(OAuthError(:invalid_client, "Unknown client"))
-        secret == expected || throw(OAuthError(:invalid_client, "Invalid client secret"))
+        secure_compare(secret, expected) || throw(OAuthError(:invalid_client, "Invalid client secret"))
         return TokenEndpointClient(client_id; public=false)
     end
     return authenticate
@@ -981,8 +1033,9 @@ end
     build_authorization_endpoint(config::AuthorizationEndpointConfig) -> Function
 
 Returns an HTTP handler that implements the OAuth 2.0 authorization
-endpoint.  The handler enforces PKCE, calls your consent callback, and
-stores issued codes in the configured store.
+endpoint.  The handler enforces PKCE according to `config.require_pkce` and
+`config.allowed_code_challenge_methods` (by default: required, `S256` only),
+calls your consent callback, and stores issued codes in the configured store.
 """
 function build_authorization_endpoint(config::AuthorizationEndpointConfig)
     function handler(req::HTTP.Request)
@@ -1015,12 +1068,19 @@ function build_authorization_endpoint(config::AuthorizationEndpointConfig)
         authz_details isa HTTP.Response && return authz_details
         code_challenge = get(params, "code_challenge", nothing)
         method_value = get(params, "code_challenge_method", nothing)
+        # RFC 7636 Section 4.3: a missing code_challenge_method defaults to "plain"
         code_challenge_method = if code_challenge === nothing
             nothing
         elseif method_value === nothing
             "PLAIN"
         else
             uppercase(String(method_value))
+        end
+        if code_challenge === nothing
+            config.require_pkce && return authorization_redirect_response(redirect_uri, state_value, ["error" => "invalid_request", "error_description" => "code_challenge is required"])
+        else
+            code_challenge_method in config.allowed_code_challenge_methods ||
+                return authorization_redirect_response(redirect_uri, state_value, ["error" => "invalid_request", "error_description" => "Unsupported code_challenge_method $(code_challenge_method)"])
         end
         resources = get(multi, "resource", nothing)
         resource_values = resources === nothing ? String[] : [String(r) for r in resources if !isempty(r)]
@@ -1099,14 +1159,14 @@ end
 
 function verify_pkce(record::AuthorizationCodeRecord, verifier::AbstractString)
     method = record.code_challenge_method === nothing ? "PLAIN" : uppercase(String(record.code_challenge_method))
-    method == "PLAIN" && return String(verifier) == record.code_challenge
+    method == "PLAIN" && return secure_compare(String(verifier), record.code_challenge)
     method == "S256" || throw(OAuthError(:invalid_grant, "Unsupported code_challenge_method $(method)"))
     challenge = try
         pkce_challenge(String(verifier))
     catch err
         throw(OAuthError(:invalid_grant, "Invalid code_verifier: $(err)"))
     end
-    return challenge == record.code_challenge
+    return secure_compare(challenge, record.code_challenge)
 end
 
 function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.Request, params::Dict{String,String})
@@ -1214,6 +1274,10 @@ abstract type EndpointAuthenticator end
     AllowAllAuthenticator()
 
 Sentinel authenticator that accepts every request.
+
+!!! warning
+    Intended for tests and localhost development only. Using it on a reachable
+    introspection or revocation endpoint leaves that endpoint open to anyone.
 """
 struct AllowAllAuthenticator <: EndpointAuthenticator end
 
@@ -1258,7 +1322,7 @@ function authenticate_request(auth::BasicCredentialsAuthenticator, req::HTTP.Req
     username = decoded[1:idx-1]
     password = decoded[idx+1:end]
     expected = get(auth.credentials, username, nothing)
-    return expected !== nothing && expected == password
+    return expected !== nothing && secure_compare(password, expected)
 end
 
 auth_challenge_headers(::AllowAllAuthenticator) = HTTP.Headers()
@@ -1347,6 +1411,8 @@ function build_verification_keys(jwks)
     key_entries isa AbstractVector || throw(ArgumentError("jwks must be a AbstractDict or AbstractVector"))
     keys = VerificationKey[]
     for item in key_entries
+        item isa AbstractDict || throw(ArgumentError("each JWKS entry must be an object"))
+        haskey(item, "kty") || throw(ArgumentError("JWKS entry is missing the required kty member"))
         kty = uppercase(String(item["kty"]))
         kid = haskey(item, "kid") ? String(item["kid"]) : nothing
         alg = haskey(item, "alg") ? Symbol(uppercase(String(item["alg"]))) : nothing
@@ -1444,6 +1510,10 @@ function extract_confirmation_thumbprint(payload)
     return nothing
 end
 
+function parse_numeric_claim(value::Bool)
+    return nothing
+end
+
 function parse_numeric_claim(value)
     if value isa Integer
         return Dates.unix2datetime(value)
@@ -1467,13 +1537,14 @@ received.  Throws `OAuthError` if validation fails.
 """
 function validate_jwt_access_token(token::AbstractString, config::TokenValidationConfig; now::DateTime=Dates.now(UTC), required_scopes=String[])
     header, payload, signature, signing_input = decode_compact_jwt(token)
-    alg_value = haskey(header, "alg") ? uppercase(String(header["alg"])) : error(OAuthError(:invalid_token, "Missing alg"))
-    alg = Symbol(alg_value)
+    haskey(header, "alg") || throw(OAuthError(:invalid_token, "Missing alg"))
+    header["alg"] isa AbstractString || throw(OAuthError(:invalid_token, "alg header must be a string"))
+    alg = Symbol(uppercase(String(header["alg"])))
     alg in config.allowed_algs || throw(OAuthError(:invalid_token, "Disallowed alg $(alg)"))
-    kid = haskey(header, "kid") ? String(header["kid"]) : nothing
+    kid = (haskey(header, "kid") && header["kid"] isa AbstractString) ? String(header["kid"]) : nothing
     key = select_verification_key(config, alg, kid)
     verify_jws(key.verifier, alg, signing_input, signature) || throw(OAuthError(:invalid_token, "JWT signature invalid"))
-    iss = haskey(payload, "iss") ? String(payload["iss"]) : nothing
+    iss = (haskey(payload, "iss") && payload["iss"] isa AbstractString) ? String(payload["iss"]) : nothing
     iss == config.issuer || throw(OAuthError(:invalid_token, "Issuer mismatch"))
     expires_at = parse_numeric_claim(get(payload, "exp", nothing))
     expires_at === nothing && throw(OAuthError(:invalid_token, "Missing exp"))
@@ -1614,12 +1685,14 @@ function verify_dpop_proof(
     for (k, v) in jwk_value
         jwk[String(k)] = v
     end
+    # RFC 9449 Section 4.3: the embedded jwk must be a public key only
+    jwk_has_private_material(jwk) && throw(OAuthError(:invalid_token, "DPoP proof jwk must not contain private key material"))
     alg_value = Symbol(uppercase(String(get(header, "alg", ""))))
     verifier = build_dpop_verifier_from_jwk(jwk, alg_value)
     verify_jws(verifier, alg_value, signing_input, signature) || throw(OAuthError(:invalid_token, "Invalid DPoP proof signature"))
     thumbprint = jwk_thumbprint(jwk)
     claims.confirmation_jkt === nothing && throw(OAuthError(:invalid_token, "Token is not sender constrained"))
-    thumbprint == claims.confirmation_jkt || throw(OAuthError(:invalid_token, "DPoP key thumbprint mismatch"))
+    secure_compare(thumbprint, claims.confirmation_jkt) || throw(OAuthError(:invalid_token, "DPoP key thumbprint mismatch"))
     expected_htu = normalized_request_url(req, origin)
     htu = get(payload, "htu", nothing)
     htu isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing htu"))
@@ -1631,7 +1704,7 @@ function verify_dpop_proof(
     ath = get(payload, "ath", nothing)
     ath isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing ath"))
     token_hash = base64url(SHA.sha256(codeunits(claims.token)))
-    String(ath) == token_hash || throw(OAuthError(:invalid_token, "DPoP ath mismatch"))
+    secure_compare(String(ath), token_hash) || throw(OAuthError(:invalid_token, "DPoP ath mismatch"))
     iat = parse_numeric_claim(get(payload, "iat", nothing))
     iat === nothing && throw(OAuthError(:invalid_token, "DPoP proof missing iat"))
     iat < now - max_age && throw(OAuthError(:invalid_token, "DPoP proof expired"))
@@ -1759,6 +1832,12 @@ end
 Produces an HTTP handler that implements RFC 7662 token introspection by
 looking up tokens in the provided `store`.  Requests are authenticated via
 the supplied `EndpointAuthenticator`.
+
+!!! warning "Authenticate this endpoint"
+    The default `AllowAllAuthenticator()` accepts every caller. RFC 7662 §2.1
+    requires introspection to be protected, since an open endpoint lets anyone
+    test captured tokens for validity. Pass a real authenticator (for example
+    [`BasicCredentialsAuthenticator`](@ref)) for anything reachable off localhost.
 """
 function build_introspection_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
@@ -1804,6 +1883,11 @@ end
 Builds an RFC 7009 token revocation endpoint backed by the supplied token
 store.  Deletes matching access tokens and returns the appropriate HTTP
 response envelope.
+
+!!! warning "Authenticate this endpoint"
+    The default `AllowAllAuthenticator()` accepts every caller, which would let
+    anyone revoke any token they can name. RFC 7009 §2.1 requires client
+    authentication; pass a real [`EndpointAuthenticator`](@ref) in production.
 """
 function build_revocation_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
     function handler(req::HTTP.Request)
