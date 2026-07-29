@@ -20,9 +20,9 @@ julia> ] add OAuth
 
 OAuth.jl is tested against Julia `1.10` and newer.
 
-## ⚠️ Upgrading to 2.1
+## ⚠️ Upgrading to 3.0
 
-2.1 tightens several defaults in the secure direction and fixes a specification bug that
+3.0 tightens several defaults in the secure direction and fixes a specification bug that
 affected interoperability. Read this before upgrading a deployed service.
 
 **1. DPoP key thumbprints (`jkt`) change value.** `jwk_thumbprint` now follows RFC 7638 §3.2
@@ -66,7 +66,7 @@ build_revocation_handler(store; authenticator = AllowAllAuthenticator())  # expl
 like `["client_credentials"]` used to be accepted and then answered with
 `unsupported_grant_type` on every request; it now throws at construction.
 
-**New in 2.1:** the built-in token endpoint implements the `refresh_token` grant (see
+**New in 3.0:** the built-in token endpoint implements the `refresh_token` grant (see
 [Token Endpoint Helpers](#token-endpoint-helpers)), client secrets and PKCE verifiers are
 compared in constant time, malformed access tokens produce `401` instead of an unhandled
 `500`, and `JWTAccessTokenIssuer` can finally derive an EC public JWK on its own.
