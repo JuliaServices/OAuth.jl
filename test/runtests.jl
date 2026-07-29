@@ -1670,7 +1670,7 @@ end
     jwks_doc = JSON.parse(String(jwks_response.body))
     @test length(jwks_doc["keys"]) == 1
 
-    introspect = build_introspection_handler(store)
+    introspect = build_introspection_handler(store; authenticator = AllowAllAuthenticator())
     body = "token=$(issued.token)"
     req_introspect = HTTP.Request("POST", "/introspect", ["Content-Type" => "application/x-www-form-urlencoded"], body)
     resp_introspect = introspect(req_introspect)
@@ -1685,7 +1685,7 @@ end
     bad_hint_doc = JSON.parse(String(bad_hint_resp.body))
     @test bad_hint_doc["error"] == "unsupported_token_type"
 
-    revoke = build_revocation_handler(store)
+    revoke = build_revocation_handler(store; authenticator = AllowAllAuthenticator())
     req_revoke = HTTP.Request("POST", "/revoke", ["Content-Type" => "application/x-www-form-urlencoded"], body)
     resp_revoke = revoke(req_revoke)
     @test resp_revoke.status == 200
@@ -2170,4 +2170,135 @@ end
     resp = middleware(leaky_req)
     @test resp.status == 401
     @test occursin("private key material", OAuth.header_value(resp.headers, "WWW-Authenticate", ""))
+end
+
+@testset "Management endpoints require an explicit authenticator" begin
+    store = InMemoryTokenStore()
+    # an unauthenticated introspection/revocation endpoint must be a deliberate choice
+    @test_throws ArgumentError build_introspection_handler(store)
+    @test_throws ArgumentError build_revocation_handler(store)
+    err = try
+        build_introspection_handler(store)
+    catch e
+        e
+    end
+    @test occursin("authenticator", err.msg)
+    @test occursin("AllowAllAuthenticator", err.msg)
+    # explicit opt-in still works
+    @test build_introspection_handler(store; authenticator = AllowAllAuthenticator()) isa Function
+    @test build_revocation_handler(store; authenticator = AllowAllAuthenticator()) isa Function
+    basic = BasicCredentialsAuthenticator(credentials = Dict("c" => "s"))
+    @test build_introspection_handler(store; authenticator = basic) isa Function
+    @test build_revocation_handler(store; authenticator = basic) isa Function
+end
+
+@testset "Token endpoint refresh_token grant" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        private_key = rsa_pem, alg = :RS256, kid = "k1")
+    validator = TokenValidationConfig(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        jwks = Dict("keys" => [public_jwk(issuer)]))
+
+    form_request(body) = HTTP.Request("POST", "/token",
+        ["Content-Type" => "application/x-www-form-urlencoded"], body)
+
+    function build_endpoint(; ttl = nothing)
+        code_store = InMemoryAuthorizationCodeStore()
+        grant_store = InMemoryRefreshTokenGrantStore()
+        cfg = TokenEndpointConfig(
+            code_store = code_store,
+            token_issuer = issuer,
+            client_authenticator = (req, params) -> TokenEndpointClient("c1"; public = true),
+            allowed_grant_types = ["authorization_code", "refresh_token"],
+            refresh_grant_store = grant_store,
+            refresh_token_ttl_seconds = ttl,
+        )
+        return build_token_endpoint(cfg), code_store, grant_store
+    end
+
+    # a refresh_grant_store is mandatory for the grant
+    @test_throws ArgumentError TokenEndpointConfig(
+        code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+        client_authenticator = (req, p) -> TokenEndpointClient("c1"),
+        allowed_grant_types = ["authorization_code", "refresh_token"])
+
+    # authorization_code now hands back a refresh token and records the grant
+    handler, code_store, grant_store = build_endpoint()
+    verifier = generate_pkce_verifier()
+    now_time = Dates.now(UTC)
+    store_authorization_code!(code_store, OAuth.AuthorizationCodeRecord(
+        "code-1", "c1", "https://app/cb", ["read", "write"], "user-1",
+        pkce_challenge(verifier), "S256", now_time, now_time + Dates.Hour(1),
+        nothing, ["https://api.example"], Dict{String,Any}()))
+    resp = handler(form_request("grant_type=authorization_code&code=code-1&redirect_uri=$(HTTP.escapeuri("https://app/cb"))&code_verifier=$(verifier.verifier)"))
+    @test resp.status == 200
+    body = JSON.parse(String(resp.body))
+    refresh = body["refresh_token"]
+    @test refresh isa String && !isempty(refresh)
+    @test lookup_refresh_token_grant(grant_store, refresh) !== nothing
+
+    # redeeming it mints a new access token carrying the original subject/scope
+    resp2 = handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(refresh))"))
+    @test resp2.status == 200
+    body2 = JSON.parse(String(resp2.body))
+    claims = validate_jwt_access_token(body2["access_token"], validator)
+    @test claims.subject == "user-1"
+    @test sort(claims.scope) == ["read", "write"]
+    @test body2["resource"] == ["https://api.example"]
+
+    # tokens are rotated: a new one is returned and the old one no longer works
+    rotated = body2["refresh_token"]
+    @test rotated != refresh
+    replay = handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(refresh))"))
+    @test replay.status == 400
+    @test JSON.parse(String(replay.body))["error"] == "invalid_grant"
+    @test handler(form_request("grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(rotated))")).status == 200
+
+    # unknown tokens and missing parameters
+    @test JSON.parse(String(handler(form_request("grant_type=refresh_token&refresh_token=nope")).body))["error"] == "invalid_grant"
+    @test JSON.parse(String(handler(form_request("grant_type=refresh_token")).body))["error"] == "invalid_request"
+
+    # scope may be narrowed but never widened (RFC 6749 Section 6)
+    handler2, code_store2, grant_store2 = build_endpoint()
+    store_refresh_token_grant!(grant_store2, OAuth.RefreshTokenGrantRecord(
+        "rt-scope", "c1", "user-2", ["read", "write"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    narrowed = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope&scope=read"))
+    @test narrowed.status == 200
+    @test JSON.parse(String(narrowed.body))["scope"] == "read"
+    store_refresh_token_grant!(grant_store2, OAuth.RefreshTokenGrantRecord(
+        "rt-scope2", "c1", "user-2", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    widened = handler2(form_request("grant_type=refresh_token&refresh_token=rt-scope2&scope=read+admin"))
+    @test widened.status == 400
+    @test JSON.parse(String(widened.body))["error"] == "invalid_scope"
+
+    # a refresh token is bound to the client it was issued to
+    handler3, _, grant_store3 = build_endpoint()
+    store_refresh_token_grant!(grant_store3, OAuth.RefreshTokenGrantRecord(
+        "rt-other", "other-client", "user-3", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    mismatched = handler3(form_request("grant_type=refresh_token&refresh_token=rt-other"))
+    @test mismatched.status == 400
+    @test JSON.parse(String(mismatched.body))["error"] == "invalid_grant"
+
+    # expiry is enforced
+    handler4, _, grant_store4 = build_endpoint(ttl = 3600)
+    past = now_time - Dates.Hour(2)
+    store_refresh_token_grant!(grant_store4, OAuth.RefreshTokenGrantRecord(
+        "rt-expired", "c1", "user-4", ["read"], String[], nothing,
+        Dict{String,Any}(), past, past + Dates.Minute(1)); now = past)
+    expired = handler4(form_request("grant_type=refresh_token&refresh_token=rt-expired"))
+    @test expired.status == 400
+    @test JSON.parse(String(expired.body))["error"] == "invalid_grant"
+
+    # without the grant in allowed_grant_types the endpoint still refuses it
+    plain_cfg = TokenEndpointConfig(
+        code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+        client_authenticator = (req, p) -> TokenEndpointClient("c1"; public = true))
+    plain = build_token_endpoint(plain_cfg)
+    resp_unsupported = plain(form_request("grant_type=refresh_token&refresh_token=x"))
+    @test JSON.parse(String(resp_unsupported.body))["error"] == "unsupported_grant_type"
 end

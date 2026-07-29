@@ -909,7 +909,93 @@ end
 """Normalizes inputs before building a `TokenEndpointClient`."""
 TokenEndpointClient(client_id::AbstractString; public::Bool=false) = TokenEndpointClient(String(client_id), Bool(public))
 
-const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code"])
+"""
+    RefreshTokenGrantStore
+
+Server-side storage interface for refresh tokens issued by the built-in token
+endpoint.  This is the authorization-server counterpart to the client-side
+[`RefreshTokenStore`](@ref): it remembers what a refresh token was granted for
+so the `refresh_token` grant can mint a new access token from it.
+"""
+abstract type RefreshTokenGrantStore end
+
+"""
+    RefreshTokenGrantRecord
+
+Everything the token endpoint needs to honour a refresh token: the client it was
+issued to, the authenticated subject, and the scope/resource/claims of the
+original grant.
+"""
+struct RefreshTokenGrantRecord
+    token::String
+    client_id::String
+    subject::Union{String,Nothing}
+    scope::Vector{String}
+    resource::Vector{String}
+    authorization_details::Union{Nothing,Any}
+    extra_claims::Dict{String,Any}
+    issued_at::DateTime
+    expires_at::Union{DateTime,Nothing}
+end
+
+"""In-memory implementation of [`RefreshTokenGrantStore`](@ref)."""
+mutable struct InMemoryRefreshTokenGrantStore <: RefreshTokenGrantStore
+    lock::ReentrantLock
+    records::Dict{String,RefreshTokenGrantRecord}
+end
+
+InMemoryRefreshTokenGrantStore() = InMemoryRefreshTokenGrantStore(ReentrantLock(), Dict{String,RefreshTokenGrantRecord}())
+
+function purge_expired_refresh_grants!(store::InMemoryRefreshTokenGrantStore, now::DateTime)
+    expired = String[]
+    for (token, record) in store.records
+        record.expires_at !== nothing && now > record.expires_at && push!(expired, token)
+    end
+    for token in expired
+        delete!(store.records, token)
+    end
+    return length(expired)
+end
+
+"""
+    store_refresh_token_grant!(store, record; now=Dates.now(UTC))
+
+Persists a refresh token grant.  Expired grants are dropped on each insert so the
+store does not grow without bound.
+"""
+function store_refresh_token_grant!(store::InMemoryRefreshTokenGrantStore, record::RefreshTokenGrantRecord; now::DateTime=Dates.now(UTC))
+    lock(store.lock) do
+        purge_expired_refresh_grants!(store, now)
+        store.records[record.token] = record
+    end
+    return record
+end
+
+"""
+    consume_refresh_token_grant!(store, token) -> Union{RefreshTokenGrantRecord,Nothing}
+
+Atomically removes and returns a refresh token grant.  Removal is what makes
+refresh token rotation work: a token that has already been redeemed is no longer
+present, so replaying it fails.
+"""
+function consume_refresh_token_grant!(store::InMemoryRefreshTokenGrantStore, token::AbstractString)
+    lock(store.lock) do
+        return pop!(store.records, String(token), nothing)
+    end
+end
+
+"""
+    lookup_refresh_token_grant(store, token) -> Union{RefreshTokenGrantRecord,Nothing}
+
+Returns a refresh token grant without consuming it.
+"""
+function lookup_refresh_token_grant(store::InMemoryRefreshTokenGrantStore, token::AbstractString)
+    lock(store.lock) do
+        return get(store.records, String(token), nothing)
+    end
+end
+
+const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code", "refresh_token"])
 
 """
     TokenEndpointConfig
@@ -926,19 +1012,28 @@ struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:
     extra_token_claims::E
     token_store::Union{AccessTokenStore,Nothing}
     allowed_grant_types::Set{String}
+    refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}
+    refresh_token_ttl::Union{Dates.Second,Nothing}
 end
 
 """
-    TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=[\"authorization_code\"])
+    TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store=nothing, refresh_token_ttl_seconds=nothing)
 
 Validates and normalizes the callbacks before handing the struct to
 [`build_token_endpoint`](@ref).
+
+To support the `refresh_token` grant, add it to `allowed_grant_types` and supply a
+`refresh_grant_store` (for example [`InMemoryRefreshTokenGrantStore`](@ref)); the
+endpoint then issues a refresh token alongside each access token and honours it
+later.  `refresh_token_ttl_seconds` bounds how long a refresh token stays valid
+(`nothing` means no expiry).  Refresh tokens are rotated on every use.
 """
-function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"])
+function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}=nothing, refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing)
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
     token_issuer isa JWTAccessTokenIssuer || throw(ArgumentError("token_issuer must be a JWTAccessTokenIssuer"))
     client_authenticator isa Function || throw(ArgumentError("client_authenticator must be callable"))
-    refresh_fn = refresh_token_generator === nothing ? (_record, _client) -> nothing : refresh_token_generator
+    default_refresh = refresh_grant_store === nothing ? (_record, _client) -> nothing : (_record, _client) -> random_state(bytes=32)
+    refresh_fn = refresh_token_generator === nothing ? default_refresh : refresh_token_generator
     extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
     allowed = Set(lowercase.(String.(allowed_grant_types)))
     isempty(allowed) && throw(ArgumentError("allowed_grant_types must not be empty"))
@@ -946,7 +1041,12 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     # answering every such request with unsupported_grant_type at runtime
     unsupported = setdiff(allowed, SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES)
     isempty(unsupported) || throw(ArgumentError("Unsupported grant type(s) for the built-in token endpoint: $(join(sort(collect(unsupported)), ", ")); supported: $(join(sort(collect(SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES)), ", "))"))
-    return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed)
+    if "refresh_token" in allowed && refresh_grant_store === nothing
+        throw(ArgumentError("the refresh_token grant requires a refresh_grant_store (for example InMemoryRefreshTokenGrantStore())"))
+    end
+    ttl = refresh_token_ttl_seconds === nothing ? nothing : Dates.Second(Int(refresh_token_ttl_seconds))
+    ttl !== nothing && Dates.value(ttl) <= 0 && throw(ArgumentError("refresh_token_ttl_seconds must be positive"))
+    return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed, refresh_grant_store, ttl)
 end
 
 """
@@ -1226,7 +1326,14 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     record.authorization_details !== nothing && (response["authorization_details"] = record.authorization_details)
     !isempty(record.resource) && (response["resource"] = record.resource)
     refresh_token = config.refresh_token_generator(record, client)
-    refresh_token === nothing || (response["refresh_token"] = String(refresh_token))
+    if refresh_token !== nothing
+        response["refresh_token"] = String(refresh_token)
+        persist_refresh_grant!(config, String(refresh_token), client.client_id, record.subject, record.scope, record.resource, record.authorization_details, extra_claims, now_time)
+    end
+    return token_success_response(response)
+end
+
+function token_success_response(response::Dict{String,Any})
     headers = prepare_headers([
         "Content-Type" => "application/json",
         "Cache-Control" => "no-store",
@@ -1235,12 +1342,103 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     return HTTP.Response(200, headers, JSON.json(response))
 end
 
+function persist_refresh_grant!(config::TokenEndpointConfig, token::String, client_id, subject, scope, resource, authorization_details, extra_claims, now::DateTime)
+    store = config.refresh_grant_store
+    store === nothing && return nothing
+    expires_at = config.refresh_token_ttl === nothing ? nothing : now + config.refresh_token_ttl
+    record = RefreshTokenGrantRecord(
+        token,
+        String(client_id),
+        subject === nothing ? nothing : String(subject),
+        [String(s) for s in scope],
+        [String(r) for r in resource],
+        authorization_details,
+        Dict{String,Any}(extra_claims),
+        now,
+        expires_at,
+    )
+    store_refresh_token_grant!(store, record; now=now)
+    return record
+end
+
+function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Request, params::Dict{String,String})
+    store = config.refresh_grant_store
+    store === nothing && return token_error_response("unsupported_grant_type", "Grant type refresh_token is not supported")
+    token_value = get(params, "refresh_token", nothing)
+    token_value === nothing && return token_error_response("invalid_request", "refresh_token is required")
+    client = try
+        config.client_authenticator(req, params)
+    catch err
+        if err isa OAuthError
+            if err.code == :invalid_client
+                headers = prepare_headers(["WWW-Authenticate" => "Basic realm=\"token\""])
+                return token_error_response("invalid_client", err.message; status=401, headers=headers)
+            else
+                return token_error_response(String(err.code), err.message)
+            end
+        else
+            rethrow()
+        end
+    end
+    client isa TokenEndpointClient || throw(ArgumentError("client_authenticator must return TokenEndpointClient"))
+    # consuming the token rotates it: a replayed refresh token is simply absent
+    record = consume_refresh_token_grant!(store, token_value)
+    record === nothing && return token_error_response("invalid_grant", "refresh token is invalid or has already been used")
+    now_time = Dates.now(UTC)
+    if record.expires_at !== nothing && now_time > record.expires_at
+        return token_error_response("invalid_grant", "refresh token expired")
+    end
+    record.client_id == client.client_id || return token_error_response("invalid_grant", "refresh token was issued to a different client")
+    # RFC 6749 Section 6: a requested scope must not exceed the originally granted scope
+    granted_scope = copy(record.scope)
+    requested = get(params, "scope", nothing)
+    if requested !== nothing
+        requested_scope = parse_scope_list(requested)
+        extra = [s for s in requested_scope if !(s in record.scope)]
+        isempty(extra) || return token_error_response("invalid_scope", "Requested scope exceeds the original grant: $(join(sort(extra), ", "))")
+        granted_scope = requested_scope
+    end
+    extra_claims = Dict{String,Any}()
+    for (k, v) in record.extra_claims
+        extra_claims[String(k)] = v
+    end
+    custom_claims = config.extra_token_claims(record, client)
+    for (k, v) in custom_claims
+        extra_claims[String(k)] = v
+    end
+    issued = issue_access_token(
+        config.token_issuer;
+        subject = record.subject,
+        client_id = record.client_id,
+        scope = granted_scope,
+        authorization_details = record.authorization_details,
+        extra_claims = extra_claims,
+        store = config.token_store,
+        now = now_time,
+    )
+    response = Dict{String,Any}(
+        "access_token" => issued.token,
+        "token_type" => "Bearer",
+        "expires_in" => config.token_issuer.expires_in,
+    )
+    !isempty(granted_scope) && (response["scope"] = join(granted_scope, ' '))
+    record.authorization_details !== nothing && (response["authorization_details"] = record.authorization_details)
+    !isempty(record.resource) && (response["resource"] = record.resource)
+    new_refresh = config.refresh_token_generator(record, client)
+    if new_refresh !== nothing
+        response["refresh_token"] = String(new_refresh)
+        persist_refresh_grant!(config, String(new_refresh), record.client_id, record.subject, granted_scope, record.resource, record.authorization_details, record.extra_claims, now_time)
+    end
+    return token_success_response(response)
+end
+
 """
     build_token_endpoint(config::TokenEndpointConfig) -> Function
 
 Creates a handler that implements the OAuth 2.0 token endpoint for the
-authorization_code grant.  It verifies client credentials, enforces PKCE,
-issues JWT access tokens, and optionally persists refresh tokens.
+`authorization_code` grant and, when a `refresh_grant_store` is configured, the
+`refresh_token` grant.  It verifies client credentials, enforces PKCE, issues JWT
+access tokens, and rotates refresh tokens on every use.
 """
 function build_token_endpoint(config::TokenEndpointConfig)
     function handler(req::HTTP.Request)
@@ -1255,6 +1453,8 @@ function build_token_endpoint(config::TokenEndpointConfig)
         normalized_grant in config.allowed_grant_types || return token_error_response("unsupported_grant_type", "Grant type $(grant_type) is not supported")
         if normalized_grant == "authorization_code"
             return handle_authorization_code_grant(config, req, params)
+        elseif normalized_grant == "refresh_token"
+            return handle_refresh_token_grant(config, req, params)
         else
             return token_error_response("unsupported_grant_type", "Grant type $(grant_type) is not supported")
         end
@@ -1329,6 +1529,17 @@ auth_challenge_headers(::AllowAllAuthenticator) = HTTP.Headers()
 function auth_challenge_headers(auth::BasicCredentialsAuthenticator)
     header = "Basic realm=\"$(auth.realm)\", charset=\"UTF-8\""
     return prepare_headers(["WWW-Authenticate" => header])
+end
+
+# These endpoints previously defaulted to AllowAllAuthenticator(), which silently
+# left them open to anyone who could reach them. Choosing is now mandatory, so an
+# unauthenticated endpoint can only ever be a deliberate decision.
+function require_endpoint_authenticator(authenticator, builder::AbstractString, endpoint::AbstractString)
+    authenticator === nothing && throw(ArgumentError(
+        "$(builder) requires an `authenticator`: an unauthenticated $(endpoint) endpoint is open to anyone " *
+        "(RFC 7662/7009 require client authentication). Pass authenticator=BasicCredentialsAuthenticator(credentials=...), " *
+        "or authenticator=AllowAllAuthenticator() to opt out explicitly for tests and localhost."))
+    return authenticator
 end
 
 function unauthorized_endpoint_response(authenticator::EndpointAuthenticator)
@@ -1830,16 +2041,16 @@ end
     build_introspection_handler(store; authenticator=AllowAllAuthenticator()) -> Function
 
 Produces an HTTP handler that implements RFC 7662 token introspection by
-looking up tokens in the provided `store`.  Requests are authenticated via
-the supplied `EndpointAuthenticator`.
+looking up tokens in the provided `store`.  Requests are authenticated via the
+`authenticator` keyword argument, which is **required**: RFC 7662 §2.1 requires
+introspection to be protected, since an open endpoint lets anyone test captured
+tokens for validity.
 
-!!! warning "Authenticate this endpoint"
-    The default `AllowAllAuthenticator()` accepts every caller. RFC 7662 §2.1
-    requires introspection to be protected, since an open endpoint lets anyone
-    test captured tokens for validity. Pass a real authenticator (for example
-    [`BasicCredentialsAuthenticator`](@ref)) for anything reachable off localhost.
+Pass a real authenticator such as [`BasicCredentialsAuthenticator`](@ref), or
+`AllowAllAuthenticator()` to explicitly opt out for tests and localhost.
 """
-function build_introspection_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
+function build_introspection_handler(store::InMemoryTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
+    authenticator = require_endpoint_authenticator(authenticator, "build_introspection_handler", "introspection")
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
         request_method(req) == "POST" || return HTTP.Response(405, prepare_headers(["Allow" => "POST"]), "")
@@ -1882,14 +2093,15 @@ end
 
 Builds an RFC 7009 token revocation endpoint backed by the supplied token
 store.  Deletes matching access tokens and returns the appropriate HTTP
-response envelope.
+response envelope.  The `authenticator` keyword argument is **required**: an
+unauthenticated revocation endpoint lets anyone revoke any token they can name,
+and RFC 7009 §2.1 requires client authentication.
 
-!!! warning "Authenticate this endpoint"
-    The default `AllowAllAuthenticator()` accepts every caller, which would let
-    anyone revoke any token they can name. RFC 7009 §2.1 requires client
-    authentication; pass a real [`EndpointAuthenticator`](@ref) in production.
+Pass a real authenticator such as [`BasicCredentialsAuthenticator`](@ref), or
+`AllowAllAuthenticator()` to explicitly opt out for tests and localhost.
 """
-function build_revocation_handler(store::InMemoryTokenStore; authenticator::EndpointAuthenticator=AllowAllAuthenticator())
+function build_revocation_handler(store::InMemoryTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
+    authenticator = require_endpoint_authenticator(authenticator, "build_revocation_handler", "revocation")
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
         request_method(req) == "POST" || return HTTP.Response(405, prepare_headers(["Allow" => "POST"]), "")
