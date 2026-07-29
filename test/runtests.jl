@@ -1892,3 +1892,19 @@ end
     @test issuer_call[1] == "https://id.register/register"
     @test HTTP.header(issuer_call[2], "Authorization") == "Bearer issuer-token"
 end
+
+@testset "take_with_timeout does not discard a late redirect" begin
+    # A redirect that lands while this task is descheduled (e.g. another task held
+    # the thread) must still be returned rather than reported as a timeout.
+    channel = Channel{OAuth.StringParams}(1)
+    params = OAuth.StringParams("code" => "abc", "state" => "s")
+    put!(channel, params)
+    @test OAuth.take_with_timeout(channel, 0) == params
+
+    empty_channel = Channel{OAuth.StringParams}(1)
+    @test_throws OAuthError OAuth.take_with_timeout(empty_channel, 0)
+
+    delivered = Channel{OAuth.StringParams}(1)
+    @async (sleep(0.2); put!(delivered, params))
+    @test OAuth.take_with_timeout(delivered, 5) == params
+end
