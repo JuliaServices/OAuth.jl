@@ -3,6 +3,7 @@ using Test
 const _TRIM_SAFE_ERROR_BUDGET = 0
 const _TRIM_SUPPORTED = VERSION >= v"1.12.0-rc1"
 const _TRIM_PRE_RELEASE = !isempty(VERSION.prerelease)
+const _TRIM_SETUP_TIMEOUT_S = Sys.iswindows() ? 600.0 : 120.0
 const _TRIM_COMPILE_TIMEOUT_S = Sys.iswindows() ? 600.0 : 120.0
 const _TRIM_EXECUTABLE_TIMEOUT_S = Sys.iswindows() ? 120.0 : 30.0
 const _TRIM_USE_BUNDLE = Sys.iswindows()
@@ -30,7 +31,7 @@ function _setup_trim_env()
     flush(stdout)
     exit_code, output, timed_out = _run_command_with_timeout(
         _clean_cmd(`$julia --startup-file=no --history-file=no --project=$env_path $setup_script`);
-        timeout_s = 120.0,
+        timeout_s = _TRIM_SETUP_TIMEOUT_S,
         log_label = "setup",
     )
     rm(setup_script; force = true)
