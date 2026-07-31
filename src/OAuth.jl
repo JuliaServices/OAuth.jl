@@ -1,5 +1,6 @@
 module OAuth
 
+using AbstractStores
 using Dates, HTTP, JSON, Random, SHA, Base64, LibAwsCal, LibAwsCommon, FileWatching
 
 const DEFAULT_RESPONSE_TYPE = "code"

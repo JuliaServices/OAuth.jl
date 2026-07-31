@@ -34,6 +34,17 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
+      # Julia 1.10 predates Project.toml [sources]. Remove this bootstrap after
+      # AbstractStores is registered in General.
+      - name: Add AbstractStores on Julia 1.10
+        if: ${{ matrix.version == '1.10' }}
+        shell: julia --color=yes --project=. {0}
+        run: |
+          using Pkg
+          Pkg.add(PackageSpec(
+            url = "https://github.com/JuliaServices/AbstractStores.jl.git",
+            rev = "4900d65ab7a370ef770b8fe0759d19635842f64c",
+          ))
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1

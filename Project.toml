@@ -3,6 +3,7 @@ uuid = "22d8b318-f366-56fb-a292-a93f7d76c017"
 version = "3.0.0"
 
 [deps]
+AbstractStores = "b8592f88-5fd7-4e10-8c52-04e8e19aea3c"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 FileWatching = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
@@ -15,7 +16,11 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
+[sources]
+AbstractStores = {url = "https://github.com/JuliaServices/AbstractStores.jl.git", rev = "4900d65ab7a370ef770b8fe0759d19635842f64c"}
+
 [compat]
+AbstractStores = "0.1"
 HTTP = "2"
 JSON = "1"
 LibAwsCal = "1.1"

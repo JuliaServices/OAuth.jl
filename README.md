@@ -360,7 +360,7 @@ register_jwks_endpoint!(router, [public_jwk(token_issuer)])
 
 ### JWT Access Token Issuance & Storage
 
-`JWTAccessTokenIssuer` signs tokens, and the optional `AccessTokenStore` captures issued tokens for introspection and revocation. Tokens inherit scopes, authorization details, audiences, confirmation (`cnf`) claims, and extra custom claims in a single call.
+`JWTAccessTokenIssuer` signs tokens, and the optional `AccessTokenStore` captures issued tokens for introspection and revocation. Server stores use the `AbstractStores.jl` interface. The application can therefore choose process memory, files, Redis, SQL, or another conforming backend. Tokens inherit scopes, authorization details, audiences, confirmation (`cnf`) claims, and extra custom claims in a single call.
 
 ```julia
 token_store = InMemoryTokenStore()
@@ -383,6 +383,44 @@ claims = validate_jwt_access_token(issued.token, validator; required_scopes = ["
 ```
 
 `AccessTokenClaims` includes the parsed scope list, audience, confirmation thumbprint, client ID, and raw claims you can use for authorization decisions.
+
+### Choosing a Server State Backend
+
+The three authorization-server stores can share one physical backend. OAuth
+adds separate prefixes for access tokens, authorization codes, and refresh
+grants:
+
+```julia
+using AbstractStores, OAuth
+
+backend = MemoryStore()
+stores = OAuth.authorization_server_stores(backend)
+
+token_store = stores.access_tokens
+code_store = stores.authorization_codes
+refresh_grant_store = stores.refresh_grants
+```
+
+Only the backend construction changes when state must survive a restart:
+
+```julia
+backend = FileStore(joinpath(homedir(), ".my-service", "state"))
+stores = OAuth.authorization_server_stores(backend)
+```
+
+`AuthorizationEndpointConfig` requires an atomic, TTL-capable authorization-code
+store. `MemoryStore`, `SQLStore`, and `RedisStore` provide that guarantee.
+`FileStore` does not provide atomic read-modify-write across multiple processes,
+so OAuth rejects it for authorization codes. It remains valid for access-token
+state in a single service process.
+
+OAuth hashes bearer tokens, authorization codes, and refresh tokens before it
+uses them as store keys. The raw credentials remain inside the stored records.
+They do not appear in filenames or database indexes.
+
+The client-side `RefreshTokenStore` API remains separate. It includes
+configuration-aware lookup and refresh locking that a simple key-value store
+does not model.
 
 ### Protected Resource Middleware
 

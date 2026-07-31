@@ -444,13 +444,39 @@ function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol
 end
 
 """
+    AccessTokenRecord
+
+Stored representation of an issued access token.
+"""
+struct AccessTokenRecord
+    token::String
+    scope::Vector{String}
+    issued_at::DateTime
+    expires_at::DateTime
+    client_id::Union{String,Nothing}
+    subject::Union{String,Nothing}
+    claims::Dict{String,Any}
+    revoked::Bool
+    confirmation_jkt::Union{String,Nothing}
+end
+
+"""
     AccessTokenStore
 
-Abstract storage backend for bearer tokens that you issue via the server
-helpers.  Implementors persist/retrieve arbitrary dictionaries keyed by a
-token string.
+An [`AbstractStores.AbstractStore`](@ref) containing [`AccessTokenRecord`](@ref)
+values. OAuth owns the value type and token lifecycle. The application chooses
+the storage backend.
 """
-abstract type AccessTokenStore end
+const AccessTokenStore = AbstractStore{AccessTokenRecord}
+
+"""
+    InMemoryTokenStore()
+
+The default process-local [`AccessTokenStore`](@ref). It is an
+[`AbstractStores.MemoryStore`](@ref), so it supports expiry and atomic updates
+within one process.
+"""
+const InMemoryTokenStore = MemoryStore{AccessTokenRecord}
 
 """
     IssuedAccessToken
@@ -577,18 +603,6 @@ function derive_signing_jwk(_private_key, signer::EdDSASigner, alg::Symbol, kid:
     return jwk
 end
 
-mutable struct AccessTokenRecord
-    token::String
-    scope::Vector{String}
-    issued_at::DateTime
-    expires_at::DateTime
-    client_id::Union{String,Nothing}
-    subject::Union{String,Nothing}
-    claims::Dict{String,Any}
-    revoked::Bool
-    confirmation_jkt::Union{String,Nothing}
-end
-
 """
     DPoPReplayCache
 
@@ -634,38 +648,31 @@ function record_dpop_proof!(cache::DPoPReplayCache, jti::AbstractString, now::Da
     end
 end
 
-"""
-    InMemoryTokenStore()
+state_key(secret::AbstractString) = bytes2hex(SHA.sha256(codeunits(String(secret))))
 
-Simple dictionary-backed implementation of [`AccessTokenStore`](@ref).  Best
-suited for tests or single-process resource servers.
-"""
-mutable struct InMemoryTokenStore <: AccessTokenStore
-    lock::ReentrantLock
-    records::Dict{String,AccessTokenRecord}
-end
-
-InMemoryTokenStore() = InMemoryTokenStore(ReentrantLock(), Dict{String,AccessTokenRecord}())
-
-function purge_expired_access_tokens!(store::InMemoryTokenStore, now::DateTime)
-    expired = String[]
-    for (token, record) in store.records
-        now > record.expires_at && push!(expired, token)
+function put_until!(store::AbstractStore, key::AbstractString, value,
+                    expires_at::DateTime, now::DateTime)
+    ttl = expires_at - now
+    if ttl <= Dates.Millisecond(0)
+        delete!(store, key)
+    else
+        put!(store, key, value; ttl)
     end
-    for token in expired
-        delete!(store.records, token)
-    end
-    return length(expired)
+    return value
 end
 
 """
     store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken; now=Dates.now(UTC))
 
 Persists an issued token into the backing store so later introspection or
-revocation checks can find it.  Tokens that expired before `now` are dropped
-on each insert so a long-lived store does not grow without bound.
+revocation checks can find it. The store TTL removes it after `expires_at`.
+
+The token is SHA-256 hashed before it becomes a store key. This keeps bearer
+credentials out of filenames and database indexes, and it keeps long JWTs below
+filesystem filename limits.
 """
-function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToken; now::DateTime=Dates.now(UTC))
+function store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken;
+                             now::DateTime=Dates.now(UTC))
     record = AccessTokenRecord(
         issued.token,
         copy(issued.scope),
@@ -677,54 +684,35 @@ function store_access_token!(store::InMemoryTokenStore, issued::IssuedAccessToke
         false,
         issued.confirmation_jkt,
     )
-    lock(store.lock) do
-        # expired tokens are never valid for introspection again, so drop them
-        # instead of growing the store without bound
-        purge_expired_access_tokens!(store, now)
-        store.records[issued.token] = record
-    end
-    return record
+    return put_until!(store, state_key(issued.token), record, issued.expires_at, now)
 end
 
 """
-    lookup_access_token(store::AccessTokenStore, token::AbstractString) -> Union{IssuedAccessToken,Nothing}
+    lookup_access_token(store::AccessTokenStore, token::AbstractString) -> Union{AccessTokenRecord,Nothing}
 
 Fetches a previously stored token record or returns `nothing` if the token
 is unknown (or revoked).
 """
-function lookup_access_token(store::InMemoryTokenStore, token::AbstractString)
-    lock(store.lock) do
-        return get(store.records, String(token), nothing)
-    end
-end
+lookup_access_token(store::AccessTokenStore, token::AbstractString) =
+    get(store, state_key(token), nothing)
 
 """
     revoke_access_token!(store::AccessTokenStore, token::AbstractString)
 
-Removes a token from the store so future introspection attempts consider it
-invalid.
-"""
-function revoke_access_token!(store::InMemoryTokenStore, token::AbstractString)
-    lock(store.lock) do
-        record = get(store.records, String(token), nothing)
-        record === nothing && return false
-        record.revoked = true
-        return true
-    end
-end
+Atomically removes a token record. Future introspection attempts then consider
+it invalid.
 
+Deleting the record also preserves its bounded lifecycle. Rewriting a revoked
+record without its original TTL would leave a permanent tombstone in backends
+that implement expiry.
 """
-    AuthorizationCodeStore
-
-Storage interface for authorization codes generated by the embedded AS.
-"""
-abstract type AuthorizationCodeStore end
+revoke_access_token!(store::AccessTokenStore, token::AbstractString) =
+    pop!(store, state_key(token), nothing) !== nothing
 
 """
     AuthorizationCodeRecord
 
-Internal struct that captures everything needed to validate an
-authorization code (scope, PKCE challenge, expiration, etc.).
+Everything needed to validate one authorization code.
 """
 struct AuthorizationCodeRecord
     code::String
@@ -741,40 +729,27 @@ struct AuthorizationCodeRecord
     extra_claims::Dict{String,Any}
 end
 
-"""In-memory implementation of [`AuthorizationCodeStore`](@ref)."""
-mutable struct InMemoryAuthorizationCodeStore <: AuthorizationCodeStore
-    lock::ReentrantLock
-    records::Dict{String,AuthorizationCodeRecord}
-end
+"""
+    AuthorizationCodeStore
 
-InMemoryAuthorizationCodeStore() = InMemoryAuthorizationCodeStore(ReentrantLock(), Dict{String,AuthorizationCodeRecord}())
+An [`AbstractStores.AbstractStore`](@ref) containing
+[`AuthorizationCodeRecord`](@ref) values.
+"""
+const AuthorizationCodeStore = AbstractStore{AuthorizationCodeRecord}
 
-function purge_expired_authorization_codes!(store::InMemoryAuthorizationCodeStore, now::DateTime)
-    expired = String[]
-    for (code, record) in store.records
-        now > record.expires_at && push!(expired, code)
-    end
-    for code in expired
-        delete!(store.records, code)
-    end
-    return length(expired)
-end
+"""The default process-local [`AuthorizationCodeStore`](@ref)."""
+const InMemoryAuthorizationCodeStore = MemoryStore{AuthorizationCodeRecord}
 
 """
     store_authorization_code!(store::AuthorizationCodeStore, record; now=Dates.now(UTC))
 
-Persists an authorization code until it is redeemed or expires.  Codes that
-expired before `now` are dropped on each insert, so codes that are never
-redeemed do not accumulate.
+Persists an authorization code until it is redeemed or expires. The code is
+hashed before it becomes a store key.
 """
-function store_authorization_code!(store::InMemoryAuthorizationCodeStore, record::AuthorizationCodeRecord; now::DateTime=Dates.now(UTC))
-    lock(store.lock) do
-        # codes that were never redeemed would otherwise accumulate forever
-        purge_expired_authorization_codes!(store, now)
-        store.records[record.code] = record
-    end
-    return record
-end
+store_authorization_code!(store::AuthorizationCodeStore,
+                          record::AuthorizationCodeRecord;
+                          now::DateTime=Dates.now(UTC)) =
+    put_until!(store, state_key(record.code), record, record.expires_at, now)
 
 """
     consume_authorization_code!(store::AuthorizationCodeStore, code) -> Union{AuthorizationCodeRecord,Nothing}
@@ -782,11 +757,9 @@ end
 Atomically removes the specified code and returns its record so grant
 handlers can mint tokens.
 """
-function consume_authorization_code!(store::InMemoryAuthorizationCodeStore, code::AbstractString)
-    lock(store.lock) do
-        return pop!(store.records, String(code), nothing)
-    end
-end
+consume_authorization_code!(store::AuthorizationCodeStore,
+                            code::AbstractString) =
+    pop!(store, state_key(code), nothing)
 
 """
     AuthorizationRequestContext
@@ -856,6 +829,22 @@ function deny_authorization(; error::AbstractString="access_denied", description
     )
 end
 
+function require_atomic_store(store::AbstractStore, purpose::AbstractString)
+    AbstractStores.isatomic(store) || throw(ArgumentError(
+        "$purpose requires an atomic store; " *
+        "AbstractStores.isatomic($(typeof(store))) is false",
+    ))
+    return store
+end
+
+function require_ttl_store(store::AbstractStore, purpose::AbstractString)
+    AbstractStores.supportsttl(store) || throw(ArgumentError(
+        "$purpose requires a store that supports TTL; " *
+        "AbstractStores.supportsttl($(typeof(store))) is false",
+    ))
+    return store
+end
+
 """
     AuthorizationEndpointConfig
 
@@ -885,6 +874,8 @@ offers no protection against code interception on the redirect leg.
 """
 function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds::Integer=600, require_pkce::Bool=true, allowed_code_challenge_methods=["S256"])
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
+    require_atomic_store(code_store, "authorization-code redemption")
+    require_ttl_store(code_store, "authorization-code expiry")
     redirect_uri_resolver isa Function || throw(ArgumentError("redirect_uri_resolver must be callable"))
     consent_handler isa Function || throw(ArgumentError("consent_handler must be callable"))
     code_ttl_seconds > 0 || throw(ArgumentError("code_ttl_seconds must be positive"))
@@ -910,16 +901,6 @@ end
 TokenEndpointClient(client_id::AbstractString; public::Bool=false) = TokenEndpointClient(String(client_id), Bool(public))
 
 """
-    RefreshTokenGrantStore
-
-Server-side storage interface for refresh tokens issued by the built-in token
-endpoint.  This is the authorization-server counterpart to the client-side
-[`RefreshTokenStore`](@ref): it remembers what a refresh token was granted for
-so the `refresh_token` grant can mint a new access token from it.
-"""
-abstract type RefreshTokenGrantStore end
-
-"""
     RefreshTokenGrantRecord
 
 Everything the token endpoint needs to honour a refresh token: the client it was
@@ -938,37 +919,33 @@ struct RefreshTokenGrantRecord
     expires_at::Union{DateTime,Nothing}
 end
 
-"""In-memory implementation of [`RefreshTokenGrantStore`](@ref)."""
-mutable struct InMemoryRefreshTokenGrantStore <: RefreshTokenGrantStore
-    lock::ReentrantLock
-    records::Dict{String,RefreshTokenGrantRecord}
-end
+"""
+    RefreshTokenGrantStore
 
-InMemoryRefreshTokenGrantStore() = InMemoryRefreshTokenGrantStore(ReentrantLock(), Dict{String,RefreshTokenGrantRecord}())
+An [`AbstractStores.AbstractStore`](@ref) containing server-side
+[`RefreshTokenGrantRecord`](@ref) values. This is the authorization-server
+counterpart to the client-side [`RefreshTokenStore`](@ref).
+"""
+const RefreshTokenGrantStore = AbstractStore{RefreshTokenGrantRecord}
 
-function purge_expired_refresh_grants!(store::InMemoryRefreshTokenGrantStore, now::DateTime)
-    expired = String[]
-    for (token, record) in store.records
-        record.expires_at !== nothing && now > record.expires_at && push!(expired, token)
-    end
-    for token in expired
-        delete!(store.records, token)
-    end
-    return length(expired)
-end
+"""The default process-local [`RefreshTokenGrantStore`](@ref)."""
+const InMemoryRefreshTokenGrantStore = MemoryStore{RefreshTokenGrantRecord}
 
 """
     store_refresh_token_grant!(store, record; now=Dates.now(UTC))
 
-Persists a refresh token grant.  Expired grants are dropped on each insert so the
-store does not grow without bound.
+Persists a refresh-token grant. The token is hashed before it becomes a store
+key. A finite `expires_at` becomes the store TTL.
 """
-function store_refresh_token_grant!(store::InMemoryRefreshTokenGrantStore, record::RefreshTokenGrantRecord; now::DateTime=Dates.now(UTC))
-    lock(store.lock) do
-        purge_expired_refresh_grants!(store, now)
-        store.records[record.token] = record
+function store_refresh_token_grant!(store::RefreshTokenGrantStore,
+                                    record::RefreshTokenGrantRecord;
+                                    now::DateTime=Dates.now(UTC))
+    key = state_key(record.token)
+    if record.expires_at === nothing
+        put!(store, key, record)
+        return record
     end
-    return record
+    return put_until!(store, key, record, record.expires_at, now)
 end
 
 """
@@ -978,21 +955,41 @@ Atomically removes and returns a refresh token grant.  Removal is what makes
 refresh token rotation work: a token that has already been redeemed is no longer
 present, so replaying it fails.
 """
-function consume_refresh_token_grant!(store::InMemoryRefreshTokenGrantStore, token::AbstractString)
-    lock(store.lock) do
-        return pop!(store.records, String(token), nothing)
-    end
-end
+consume_refresh_token_grant!(store::RefreshTokenGrantStore,
+                             token::AbstractString) =
+    pop!(store, state_key(token), nothing)
 
 """
     lookup_refresh_token_grant(store, token) -> Union{RefreshTokenGrantRecord,Nothing}
 
 Returns a refresh token grant without consuming it.
 """
-function lookup_refresh_token_grant(store::InMemoryRefreshTokenGrantStore, token::AbstractString)
-    lock(store.lock) do
-        return get(store.records, String(token), nothing)
-    end
+lookup_refresh_token_grant(store::RefreshTokenGrantStore,
+                           token::AbstractString) =
+    get(store, state_key(token), nothing)
+
+"""
+    authorization_server_stores(backend)
+
+Create namespaced access-token, authorization-code, and refresh-grant stores
+over one backend. The backend may therefore be shared with application state
+without key collisions.
+"""
+function authorization_server_stores(backend::AbstractStore)
+    return (
+        access_tokens=PrefixedStore{AccessTokenRecord}(
+            backend,
+            "oauth/access/",
+        ),
+        authorization_codes=PrefixedStore{AuthorizationCodeRecord}(
+            backend,
+            "oauth/code/",
+        ),
+        refresh_grants=PrefixedStore{RefreshTokenGrantRecord}(
+            backend,
+            "oauth/refresh/",
+        ),
+    )
 end
 
 const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code", "refresh_token"])
@@ -1030,8 +1027,12 @@ later.  `refresh_token_ttl_seconds` bounds how long a refresh token stays valid
 """
 function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}=nothing, refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing)
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
+    require_atomic_store(code_store, "authorization-code redemption")
+    require_ttl_store(code_store, "authorization-code expiry")
     token_issuer isa JWTAccessTokenIssuer || throw(ArgumentError("token_issuer must be a JWTAccessTokenIssuer"))
     client_authenticator isa Function || throw(ArgumentError("client_authenticator must be callable"))
+    token_store === nothing ||
+        require_ttl_store(token_store, "access-token expiry")
     default_refresh = refresh_grant_store === nothing ? (_record, _client) -> nothing : (_record, _client) -> random_state(bytes=32)
     refresh_fn = refresh_token_generator === nothing ? default_refresh : refresh_token_generator
     extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
@@ -1046,6 +1047,11 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     end
     ttl = refresh_token_ttl_seconds === nothing ? nothing : Dates.Second(Int(refresh_token_ttl_seconds))
     ttl !== nothing && Dates.value(ttl) <= 0 && throw(ArgumentError("refresh_token_ttl_seconds must be positive"))
+    if refresh_grant_store !== nothing
+        require_atomic_store(refresh_grant_store, "refresh-token rotation")
+        ttl === nothing ||
+            require_ttl_store(refresh_grant_store, "refresh-token expiry")
+    end
     return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed, refresh_grant_store, ttl)
 end
 

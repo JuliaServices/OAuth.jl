@@ -1,4 +1,5 @@
 using Test
+using AbstractStores
 using OAuth
 using HTTP
 using JSON
@@ -2127,7 +2128,7 @@ end
         allowed_code_challenge_methods = ["S512"])
 end
 
-@testset "In-memory stores evict expired entries" begin
+@testset "Stores do not retain expired entries" begin
     now_time = Dates.now(UTC)
     past = now_time - Dates.Hour(24)
 
@@ -2137,7 +2138,7 @@ end
             "expired-$i", "c1", "https://app/cb", String[], "u", nothing, nothing,
             past, past + Dates.Second(60), nothing, String[], Dict{String,Any}()))
     end
-    @test length(code_store.records) == 1  # each insert purges the previously expired ones
+    @test isempty(code_store)
     live = OAuth.AuthorizationCodeRecord(
         "live", "c1", "https://app/cb", String[], "u", nothing, nothing,
         now_time, now_time + Dates.Hour(1), nothing, String[], Dict{String,Any}())
@@ -2149,10 +2150,81 @@ end
         store_access_token!(token_store, OAuth.IssuedAccessToken(
             "expired-$i", Dict{String,Any}(), String[], past, past + Dates.Second(60), "c1", "u", nothing))
     end
-    @test length(token_store.records) == 1
+    @test isempty(token_store)
     store_access_token!(token_store, OAuth.IssuedAccessToken(
         "live", Dict{String,Any}(), String[], now_time, now_time + Dates.Hour(1), "c1", "u", nothing))
     @test lookup_access_token(token_store, "live") !== nothing
+end
+
+@testset "AbstractStores authorization-server state" begin
+    backend = MemoryStore()
+    stores = OAuth.authorization_server_stores(backend)
+    @test stores.access_tokens isa OAuth.AccessTokenStore
+    @test stores.authorization_codes isa OAuth.AuthorizationCodeStore
+    @test stores.refresh_grants isa OAuth.RefreshTokenGrantStore
+
+    now_time = Dates.now(UTC)
+    long_token = repeat("jwt-segment.", 80)
+    issued = OAuth.IssuedAccessToken(
+        long_token,
+        Dict{String,Any}("sub" => "user-1"),
+        ["read"],
+        now_time,
+        now_time + Dates.Hour(1),
+        "client-1",
+        "user-1",
+        nothing,
+    )
+    store_access_token!(stores.access_tokens, issued; now=now_time)
+    @test lookup_access_token(stores.access_tokens, long_token).subject == "user-1"
+    access_keys = collect(keys(backend; prefix="oauth/access/"))
+    @test length(access_keys) == 1
+    @test !occursin(long_token, only(access_keys))
+    @test revoke_access_token!(stores.access_tokens, long_token)
+    @test lookup_access_token(stores.access_tokens, long_token) === nothing
+
+    code = OAuth.AuthorizationCodeRecord(
+        "code-1",
+        "client-1",
+        "https://app.example/callback",
+        ["read"],
+        "user-1",
+        nothing,
+        nothing,
+        now_time,
+        now_time + Dates.Minute(1),
+        nothing,
+        String[],
+        Dict{String,Any}(),
+    )
+    store_authorization_code!(stores.authorization_codes, code; now=now_time)
+    @test consume_authorization_code!(
+        stores.authorization_codes,
+        code.code,
+    ) == code
+    @test consume_authorization_code!(
+        stores.authorization_codes,
+        code.code,
+    ) === nothing
+
+    mktempdir() do directory
+        file_backend = FileStore(directory)
+        file_stores = OAuth.authorization_server_stores(file_backend)
+        store_access_token!(file_stores.access_tokens, issued; now=now_time)
+
+        reopened = OAuth.authorization_server_stores(FileStore(directory))
+        @test lookup_access_token(reopened.access_tokens, long_token).token ==
+            long_token
+        @test all(sizeof(filename) <= 255 for filename in readdir(directory))
+
+        resolver = (_request, _client, redirect) -> redirect
+        consent = (_request, _context) -> grant_authorization("user-1")
+        @test_throws ArgumentError AuthorizationEndpointConfig(
+            code_store=file_stores.authorization_codes,
+            redirect_uri_resolver=resolver,
+            consent_handler=consent,
+        )
+    end
 end
 
 @testset "Token endpoint grant type validation" begin
