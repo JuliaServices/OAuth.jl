@@ -34,18 +34,21 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
-      # Julia 1.10 predates Project.toml [sources]. Remove this bootstrap after
-      # AbstractStores is registered in General.
-      - name: Add AbstractStores on Julia 1.10
-        if: ${{ matrix.version == '1.10' }}
+      - uses: julia-actions/cache@v2
+      # TEMPORARY: AbstractStores is not in the General registry yet, so plain
+      # resolution cannot find it. Delete this step once it is registered —
+      # Project.toml already carries the normal [deps]/[compat] entries, and the
+      # `Pkg.add` below becomes a no-op the moment the registry can serve it.
+      - name: Bootstrap unregistered AbstractStores
         shell: julia --color=yes --project=. {0}
         run: |
           using Pkg
-          Pkg.add(PackageSpec(
-            url = "https://github.com/JuliaServices/AbstractStores.jl.git",
-            rev = "4900d65ab7a370ef770b8fe0759d19635842f64c",
-          ))
-      - uses: julia-actions/cache@v2
+          try
+              Pkg.add(name="AbstractStores", version="0.1")
+          catch
+              @warn "AbstractStores not in the registry yet; adding from git"
+              Pkg.add(url="https://github.com/JuliaServices/AbstractStores.jl.git")
+          end
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
@@ -71,6 +74,15 @@ jobs:
         run: |
           using Pkg
           Pkg.activate("docs")
+          # TEMPORARY: mirrors the bootstrap in the test job, and must run before
+          # OAuth is developed here so its AbstractStores dep resolves. Delete
+          # once AbstractStores is registered in General.
+          try
+              Pkg.add(name="AbstractStores", version="0.1")
+          catch
+              @warn "AbstractStores not in the registry yet; adding from git"
+              Pkg.add(url="https://github.com/JuliaServices/AbstractStores.jl.git")
+          end
           Pkg.develop(PackageSpec(path=pwd()))
           Pkg.instantiate()
       - name: Build and deploy docs

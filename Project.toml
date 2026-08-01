@@ -16,9 +16,6 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
-[sources]
-AbstractStores = {url = "https://github.com/JuliaServices/AbstractStores.jl.git", rev = "4900d65ab7a370ef770b8fe0759d19635842f64c"}
-
 [compat]
 AbstractStores = "0.1"
 HTTP = "2"

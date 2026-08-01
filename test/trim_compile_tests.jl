@@ -24,6 +24,14 @@ function _setup_trim_env()
     setup_script = joinpath(env_path, "setup.jl")
     write(setup_script, """
     import Pkg
+    # TEMPORARY: AbstractStores is not in the General registry yet, so this fresh
+    # environment cannot resolve OAuth's dependency on it. The `Pkg.add` below
+    # becomes a plain no-op once it is registered, and this block can go away.
+    try
+        Pkg.add(name="AbstractStores", version="0.1")
+    catch
+        Pkg.add(url="https://github.com/JuliaServices/AbstractStores.jl.git")
+    end
     Pkg.develop(path=$(repr(oauth_path)))
     Pkg.add("JuliaC")
     """)
