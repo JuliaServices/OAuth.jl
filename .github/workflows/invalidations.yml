@@ -20,6 +20,23 @@ jobs:
       with:
         version: '1'
     - uses: actions/checkout@v3
+    # TEMPORARY: AbstractStores is not in the General registry yet, so plain
+    # resolution cannot find it. Delete this step (both copies) once it is
+    # registered. Guarded so the default-branch leg (which may not depend on
+    # AbstractStores) is untouched.
+    - name: Bootstrap unregistered AbstractStores
+      shell: julia --color=yes --project=. {0}
+      run: |
+        using Pkg, TOML
+        deps = get(TOML.parsefile("Project.toml"), "deps", Dict())
+        if haskey(deps, "AbstractStores")
+            try
+                Pkg.add(name="AbstractStores", version="0.1")
+            catch
+                @warn "AbstractStores not in the registry yet; adding from git"
+                Pkg.add(url="https://github.com/JuliaServices/AbstractStores.jl.git")
+            end
+        end
     - uses: julia-actions/julia-buildpkg@v1
     - uses: julia-actions/julia-invalidations@v1
       id: invs_pr
@@ -27,6 +44,23 @@ jobs:
     - uses: actions/checkout@v3
       with:
         ref: ${{ github.event.repository.default_branch }}
+    # TEMPORARY: AbstractStores is not in the General registry yet, so plain
+    # resolution cannot find it. Delete this step (both copies) once it is
+    # registered. Guarded so the default-branch leg (which may not depend on
+    # AbstractStores) is untouched.
+    - name: Bootstrap unregistered AbstractStores
+      shell: julia --color=yes --project=. {0}
+      run: |
+        using Pkg, TOML
+        deps = get(TOML.parsefile("Project.toml"), "deps", Dict())
+        if haskey(deps, "AbstractStores")
+            try
+                Pkg.add(name="AbstractStores", version="0.1")
+            catch
+                @warn "AbstractStores not in the registry yet; adding from git"
+                Pkg.add(url="https://github.com/JuliaServices/AbstractStores.jl.git")
+            end
+        end
     - uses: julia-actions/julia-buildpkg@v1
     - uses: julia-actions/julia-invalidations@v1
       id: invs_default
