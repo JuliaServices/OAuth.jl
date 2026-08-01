@@ -45,7 +45,8 @@ export register_dynamic_client, register_dynamic_client_from_issuer, update_dyna
 export stop_loopback_listener
 export DEFAULT_LOOPBACK_HOST, DEFAULT_LOOPBACK_PORT, DEFAULT_LOOPBACK_PATH
 export ProtectedResourceConfig, AuthorizationServerConfig, JWTAccessTokenIssuer, IssuedAccessToken
-export AccessTokenClaims, TokenValidationConfig, InMemoryTokenStore, DPoPReplayCache, DeviceAuthorizationResponse
+export AccessTokenClaims, TokenValidationConfig, DPoPReplayCache, DeviceAuthorizationResponse
+export AccessTokenStore, AccessTokenRecord, InMemoryTokenStore
 export AllowAllAuthenticator, BasicCredentialsAuthenticator
 export register_protected_resource_metadata!, register_authorization_server_metadata!
 export register_jwks_endpoint!, protected_resource_middleware, public_jwk, DEFAULT_JWKS_PATH

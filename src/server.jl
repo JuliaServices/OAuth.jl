@@ -463,9 +463,17 @@ end
 """
     AccessTokenStore
 
-An [`AbstractStores.AbstractStore`](@ref) containing [`AccessTokenRecord`](@ref)
-values. OAuth owns the value type and token lifecycle. The application chooses
-the storage backend.
+An `AbstractStores.AbstractStore` containing [`AccessTokenRecord`](@ref) values.
+OAuth owns the value type and token lifecycle. The application chooses the
+storage backend.
+
+Records are always written with an expiry derived from the token's `exp`, so the
+store must report `AbstractStores.supportsttl(store) == true`;
+[`TokenEndpointConfig`](@ref) checks that when you hand it a `token_store`.
+
+Expired records are never returned, but a store that does not expire entries
+natively — `MemoryStore`, `FileStore` — only reclaims one when it is read. Call
+`AbstractStores.sweep!` periodically on a long-lived store.
 """
 const AccessTokenStore = AbstractStore{AccessTokenRecord}
 
@@ -473,8 +481,8 @@ const AccessTokenStore = AbstractStore{AccessTokenRecord}
     InMemoryTokenStore()
 
 The default process-local [`AccessTokenStore`](@ref). It is an
-[`AbstractStores.MemoryStore`](@ref), so it supports expiry and atomic updates
-within one process.
+`AbstractStores.MemoryStore`, so it supports expiry and atomic updates within one
+process.
 """
 const InMemoryTokenStore = MemoryStore{AccessTokenRecord}
 
@@ -732,8 +740,15 @@ end
 """
     AuthorizationCodeStore
 
-An [`AbstractStores.AbstractStore`](@ref) containing
-[`AuthorizationCodeRecord`](@ref) values.
+An `AbstractStores.AbstractStore` containing [`AuthorizationCodeRecord`](@ref)
+values.
+
+RFC 6749 §4.1.2 requires an authorization code to be usable exactly once, and
+codes are stored with a TTL, so the store must report both
+`AbstractStores.isatomic(store) == true` and
+`AbstractStores.supportsttl(store) == true`. Both
+[`AuthorizationEndpointConfig`](@ref) and [`TokenEndpointConfig`](@ref) reject a
+store that does not.
 """
 const AuthorizationCodeStore = AbstractStore{AuthorizationCodeRecord}
 
@@ -829,22 +844,6 @@ function deny_authorization(; error::AbstractString="access_denied", description
     )
 end
 
-function require_atomic_store(store::AbstractStore, purpose::AbstractString)
-    AbstractStores.isatomic(store) || throw(ArgumentError(
-        "$purpose requires an atomic store; " *
-        "AbstractStores.isatomic($(typeof(store))) is false",
-    ))
-    return store
-end
-
-function require_ttl_store(store::AbstractStore, purpose::AbstractString)
-    AbstractStores.supportsttl(store) || throw(ArgumentError(
-        "$purpose requires a store that supports TTL; " *
-        "AbstractStores.supportsttl($(typeof(store))) is false",
-    ))
-    return store
-end
-
 """
     AuthorizationEndpointConfig
 
@@ -874,8 +873,8 @@ offers no protection against code interception on the redirect leg.
 """
 function AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds::Integer=600, require_pkce::Bool=true, allowed_code_challenge_methods=["S256"])
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
-    require_atomic_store(code_store, "authorization-code redemption")
-    require_ttl_store(code_store, "authorization-code expiry")
+    # single-use redemption needs a real compare-and-swap, and codes must expire
+    AbstractStores.checkstore(code_store; atomic=true, ttl=true)
     redirect_uri_resolver isa Function || throw(ArgumentError("redirect_uri_resolver must be callable"))
     consent_handler isa Function || throw(ArgumentError("consent_handler must be callable"))
     code_ttl_seconds > 0 || throw(ArgumentError("code_ttl_seconds must be positive"))
@@ -922,9 +921,13 @@ end
 """
     RefreshTokenGrantStore
 
-An [`AbstractStores.AbstractStore`](@ref) containing server-side
+An `AbstractStores.AbstractStore` containing server-side
 [`RefreshTokenGrantRecord`](@ref) values. This is the authorization-server
 counterpart to the client-side [`RefreshTokenStore`](@ref).
+
+Refresh tokens are rotated by consuming them, so the store must report
+`AbstractStores.isatomic(store) == true`; it must additionally support TTL when
+`refresh_token_ttl_seconds` is set. [`TokenEndpointConfig`](@ref) checks both.
 """
 const RefreshTokenGrantStore = AbstractStore{RefreshTokenGrantRecord}
 
@@ -969,13 +972,32 @@ lookup_refresh_token_grant(store::RefreshTokenGrantStore,
     get(store, state_key(token), nothing)
 
 """
-    authorization_server_stores(backend)
+    authorization_server_stores(backend) -> (; access_tokens, authorization_codes, refresh_grants)
 
 Create namespaced access-token, authorization-code, and refresh-grant stores
 over one backend. The backend may therefore be shared with application state
 without key collisions.
+
+`backend` must be wide enough to hold all three record types — in practice an
+`AbstractStore{Any}` — and it must hand values back unchanged. `MemoryStore`
+qualifies, as does any serializing store using the default `SerializedCodec`.
+A portable codec such as `JSONCodec` decodes at the *backend's* `eltype`, so
+records would come back as `Dict{String,Any}`; with such a codec give each kind
+of state its own concretely typed store (`FileStore{AccessTokenRecord}(...)` and
+friends) instead of calling this.
+
+The authorization-code store must additionally be atomic and TTL-capable — see
+[`AuthorizationEndpointConfig`](@ref). `FileStore` has no cross-process
+compare-and-swap, so it is rejected for authorization codes; it remains fine for
+access-token state in a single service process.
 """
 function authorization_server_stores(backend::AbstractStore)
+    for T in (AccessTokenRecord, AuthorizationCodeRecord, RefreshTokenGrantRecord)
+        eltype(backend) >: T || throw(ArgumentError(
+            "authorization_server_stores needs a backend whose eltype can hold $T; " *
+            "got $(typeof(backend)) with eltype $(eltype(backend)). Pass a store " *
+            "parameterized on `Any`, or build one typed store per record type."))
+    end
     return (
         access_tokens=PrefixedStore{AccessTokenRecord}(
             backend,
@@ -1027,12 +1049,12 @@ later.  `refresh_token_ttl_seconds` bounds how long a refresh token stays valid
 """
 function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}=nothing, refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing)
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
-    require_atomic_store(code_store, "authorization-code redemption")
-    require_ttl_store(code_store, "authorization-code expiry")
+    # single-use redemption needs a real compare-and-swap, and codes must expire
+    AbstractStores.checkstore(code_store; atomic=true, ttl=true)
     token_issuer isa JWTAccessTokenIssuer || throw(ArgumentError("token_issuer must be a JWTAccessTokenIssuer"))
     client_authenticator isa Function || throw(ArgumentError("client_authenticator must be callable"))
-    token_store === nothing ||
-        require_ttl_store(token_store, "access-token expiry")
+    # every access-token record is written with an expiry derived from its `exp`
+    token_store === nothing || AbstractStores.checkstore(token_store; ttl=true)
     default_refresh = refresh_grant_store === nothing ? (_record, _client) -> nothing : (_record, _client) -> random_state(bytes=32)
     refresh_fn = refresh_token_generator === nothing ? default_refresh : refresh_token_generator
     extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
@@ -1047,11 +1069,10 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     end
     ttl = refresh_token_ttl_seconds === nothing ? nothing : Dates.Second(Int(refresh_token_ttl_seconds))
     ttl !== nothing && Dates.value(ttl) <= 0 && throw(ArgumentError("refresh_token_ttl_seconds must be positive"))
-    if refresh_grant_store !== nothing
-        require_atomic_store(refresh_grant_store, "refresh-token rotation")
-        ttl === nothing ||
-            require_ttl_store(refresh_grant_store, "refresh-token expiry")
-    end
+    # rotation consumes the grant, so it needs the same single-use guarantee;
+    # TTL only matters when refresh tokens are given a finite lifetime
+    refresh_grant_store === nothing ||
+        AbstractStores.checkstore(refresh_grant_store; atomic=true, ttl=(ttl !== nothing))
     return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed, refresh_grant_store, ttl)
 end
 
@@ -2117,7 +2138,7 @@ tokens for validity.
 Pass a real authenticator such as [`BasicCredentialsAuthenticator`](@ref), or
 `AllowAllAuthenticator()` to explicitly opt out for tests and localhost.
 """
-function build_introspection_handler(store::InMemoryTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
+function build_introspection_handler(store::AccessTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
     authenticator = require_endpoint_authenticator(authenticator, "build_introspection_handler", "introspection")
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)
@@ -2168,7 +2189,7 @@ and RFC 7009 §2.1 requires client authentication.
 Pass a real authenticator such as [`BasicCredentialsAuthenticator`](@ref), or
 `AllowAllAuthenticator()` to explicitly opt out for tests and localhost.
 """
-function build_revocation_handler(store::InMemoryTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
+function build_revocation_handler(store::AccessTokenStore; authenticator::Union{EndpointAuthenticator,Nothing}=nothing)
     authenticator = require_endpoint_authenticator(authenticator, "build_revocation_handler", "revocation")
     function handler(req::HTTP.Request)
         authenticate_request(authenticator, req) || return unauthorized_endpoint_response(authenticator)

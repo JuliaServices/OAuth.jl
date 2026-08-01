@@ -401,18 +401,37 @@ code_store = stores.authorization_codes
 refresh_grant_store = stores.refresh_grants
 ```
 
-Only the backend construction changes when state must survive a restart:
+Only the backend construction changes when the state must survive a restart or be
+shared between server processes:
 
 ```julia
-backend = FileStore(joinpath(homedir(), ".my-service", "state"))
+backend = RedisStore{Any}(client)      # or SQLStore{Any}(conn)
 stores = OAuth.authorization_server_stores(backend)
 ```
 
-`AuthorizationEndpointConfig` requires an atomic, TTL-capable authorization-code
-store. `MemoryStore`, `SQLStore`, and `RedisStore` provide that guarantee.
-`FileStore` does not provide atomic read-modify-write across multiple processes,
-so OAuth rejects it for authorization codes. It remains valid for access-token
-state in a single service process.
+`AuthorizationEndpointConfig` and `TokenEndpointConfig` require an atomic,
+TTL-capable authorization-code store, because RFC 6749 §4.1.2 requires a code to
+be redeemable exactly once. `MemoryStore`, `SQLStore`, and `RedisStore` provide
+that guarantee. `FileStore` has no cross-process compare-and-swap, so OAuth
+rejects it for authorization codes at construction time rather than degrading
+silently; it remains valid for access-token state in a single service process.
+
+A shared backend must also hand values back unchanged, which means `MemoryStore`
+or the default `SerializedCodec`. A portable codec such as `JSONCodec` decodes at
+the *backend's* own `eltype`, so records would come back as `Dict{String,Any}`.
+With such a codec, give each kind of state its own concretely typed store instead
+of calling `authorization_server_stores`:
+
+```julia
+token_store = FileStore{OAuth.AccessTokenRecord}(dir; codec = JSONCodec())
+```
+
+Expired entries are always invisible to lookups, but *reclaiming* them is the
+backend's business. Redis and SQL expire rows on their own, while `MemoryStore`
+and `FileStore` only drop an expired entry when something reads it. A
+long-running authorization server on those backends should call
+`AbstractStores.sweep!(backend)` on a timer so unredeemed codes and lapsed tokens
+do not accumulate.
 
 OAuth hashes bearer tokens, authorization codes, and refresh tokens before it
 uses them as store keys. The raw credentials remain inside the stored records.
