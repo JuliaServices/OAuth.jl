@@ -1,4 +1,5 @@
 using Test
+using AbstractStores
 using OAuth
 using HTTP
 using JSON
@@ -2127,7 +2128,7 @@ end
         allowed_code_challenge_methods = ["S512"])
 end
 
-@testset "In-memory stores evict expired entries" begin
+@testset "Stores do not retain expired entries" begin
     now_time = Dates.now(UTC)
     past = now_time - Dates.Hour(24)
 
@@ -2137,7 +2138,7 @@ end
             "expired-$i", "c1", "https://app/cb", String[], "u", nothing, nothing,
             past, past + Dates.Second(60), nothing, String[], Dict{String,Any}()))
     end
-    @test length(code_store.records) == 1  # each insert purges the previously expired ones
+    @test isempty(code_store)
     live = OAuth.AuthorizationCodeRecord(
         "live", "c1", "https://app/cb", String[], "u", nothing, nothing,
         now_time, now_time + Dates.Hour(1), nothing, String[], Dict{String,Any}())
@@ -2149,10 +2150,204 @@ end
         store_access_token!(token_store, OAuth.IssuedAccessToken(
             "expired-$i", Dict{String,Any}(), String[], past, past + Dates.Second(60), "c1", "u", nothing))
     end
-    @test length(token_store.records) == 1
+    @test isempty(token_store)
     store_access_token!(token_store, OAuth.IssuedAccessToken(
         "live", Dict{String,Any}(), String[], now_time, now_time + Dates.Hour(1), "c1", "u", nothing))
     @test lookup_access_token(token_store, "live") !== nothing
+end
+
+@testset "AbstractStores authorization-server state" begin
+    backend = MemoryStore()
+    stores = OAuth.authorization_server_stores(backend)
+    @test stores.access_tokens isa OAuth.AccessTokenStore
+    @test stores.authorization_codes isa OAuth.AuthorizationCodeStore
+    @test stores.refresh_grants isa OAuth.RefreshTokenGrantStore
+
+    now_time = Dates.now(UTC)
+    long_token = repeat("jwt-segment.", 80)
+    issued = OAuth.IssuedAccessToken(
+        long_token,
+        Dict{String,Any}("sub" => "user-1"),
+        ["read"],
+        now_time,
+        now_time + Dates.Hour(1),
+        "client-1",
+        "user-1",
+        nothing,
+    )
+    store_access_token!(stores.access_tokens, issued; now=now_time)
+    @test lookup_access_token(stores.access_tokens, long_token).subject == "user-1"
+    access_keys = collect(keys(backend; prefix="oauth/access/"))
+    @test length(access_keys) == 1
+    @test !occursin(long_token, only(access_keys))
+    @test revoke_access_token!(stores.access_tokens, long_token)
+    @test lookup_access_token(stores.access_tokens, long_token) === nothing
+
+    code = OAuth.AuthorizationCodeRecord(
+        "code-1",
+        "client-1",
+        "https://app.example/callback",
+        ["read"],
+        "user-1",
+        nothing,
+        nothing,
+        now_time,
+        now_time + Dates.Minute(1),
+        nothing,
+        String[],
+        Dict{String,Any}(),
+    )
+    store_authorization_code!(stores.authorization_codes, code; now=now_time)
+    @test consume_authorization_code!(
+        stores.authorization_codes,
+        code.code,
+    ) == code
+    @test consume_authorization_code!(
+        stores.authorization_codes,
+        code.code,
+    ) === nothing
+
+    mktempdir() do directory
+        file_backend = FileStore(directory)
+        file_stores = OAuth.authorization_server_stores(file_backend)
+        store_access_token!(file_stores.access_tokens, issued; now=now_time)
+
+        reopened = OAuth.authorization_server_stores(FileStore(directory))
+        @test lookup_access_token(reopened.access_tokens, long_token).token ==
+            long_token
+        @test all(sizeof(filename) <= 255 for filename in readdir(directory))
+
+        resolver = (_request, _client, redirect) -> redirect
+        consent = (_request, _context) -> grant_authorization("user-1")
+        @test_throws ArgumentError AuthorizationEndpointConfig(
+            code_store=file_stores.authorization_codes,
+            redirect_uri_resolver=resolver,
+            consent_handler=consent,
+        )
+    end
+
+    # a backend that cannot hold every record type is rejected up front rather
+    # than failing on the first `put!` with a `convert` error
+    @test_throws ArgumentError OAuth.authorization_server_stores(MemoryStore{String}())
+end
+
+@testset "Introspection and revocation accept any AccessTokenStore" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        private_key = rsa_pem, alg = :RS256, kid = "k1")
+    # not an InMemoryTokenStore: a prefixed view over a shared backend
+    store = OAuth.authorization_server_stores(MemoryStore()).access_tokens
+    issued = issue_access_token(issuer; subject = "user-1", client_id = "c1",
+        scope = ["read"], store = store)
+
+    form(body) = HTTP.Request("POST", "/x",
+        ["Content-Type" => "application/x-www-form-urlencoded"], body)
+    introspect = build_introspection_handler(store; authenticator = AllowAllAuthenticator())
+    revoke = build_revocation_handler(store; authenticator = AllowAllAuthenticator())
+
+    doc = JSON.parse(String(introspect(form("token=$(issued.token)")).body))
+    @test doc["active"] == true
+    @test doc["client_id"] == "c1"
+    @test revoke(form("token=$(issued.token)")).status == 200
+    @test JSON.parse(String(introspect(form("token=$(issued.token)")).body))["active"] == false
+    # revoking an unknown token is a no-op that reports it found nothing
+    @test revoke_access_token!(store, "never-issued") == false
+end
+
+@testset "Server state expires through the store TTL" begin
+    now_time = Dates.now(UTC)
+
+    code_store = InMemoryAuthorizationCodeStore()
+    store_authorization_code!(code_store, OAuth.AuthorizationCodeRecord(
+        "soon", "c1", "https://app/cb", String[], "u", nothing, nothing,
+        now_time, now_time + Dates.Millisecond(250), nothing, String[],
+        Dict{String,Any}()); now = now_time)
+    @test !isempty(code_store)
+
+    token_store = InMemoryTokenStore()
+    store_access_token!(token_store, OAuth.IssuedAccessToken(
+        "soon-token", Dict{String,Any}(), String[], now_time,
+        now_time + Dates.Millisecond(250), "c1", "u", nothing); now = now_time)
+    @test lookup_access_token(token_store, "soon-token") !== nothing
+
+    grant_store = InMemoryRefreshTokenGrantStore()
+    store_refresh_token_grant!(grant_store, OAuth.RefreshTokenGrantRecord(
+        "soon-grant", "c1", "u", String[], String[], nothing, Dict{String,Any}(),
+        now_time, now_time + Dates.Millisecond(250)); now = now_time)
+    # a grant with no expiry must not get one
+    store_refresh_token_grant!(grant_store, OAuth.RefreshTokenGrantRecord(
+        "forever", "c1", "u", String[], String[], nothing, Dict{String,Any}(),
+        now_time, nothing); now = now_time)
+    @test lookup_refresh_token_grant(grant_store, "soon-grant") !== nothing
+
+    sleep(0.4)
+
+    @test consume_authorization_code!(code_store, "soon") === nothing
+    @test isempty(code_store)
+    @test lookup_access_token(token_store, "soon-token") === nothing
+    @test lookup_refresh_token_grant(grant_store, "soon-grant") === nothing
+    @test lookup_refresh_token_grant(grant_store, "forever") !== nothing
+end
+
+@testset "Single-use consume has exactly one winner under concurrency" begin
+    now_time = Dates.now(UTC)
+    code_store = InMemoryAuthorizationCodeStore()
+    grant_store = InMemoryRefreshTokenGrantStore()
+    for trial in 1:25
+        code = "race-code-$trial"
+        token = "race-token-$trial"
+        store_authorization_code!(code_store, OAuth.AuthorizationCodeRecord(
+            code, "c1", "https://app/cb", String[], "u", nothing, nothing,
+            now_time, now_time + Dates.Minute(5), nothing, String[],
+            Dict{String,Any}()); now = now_time)
+        store_refresh_token_grant!(grant_store, OAuth.RefreshTokenGrantRecord(
+            token, "c1", "u", String[], String[], nothing, Dict{String,Any}(),
+            now_time, now_time + Dates.Minute(5)); now = now_time)
+
+        codes = Vector{Any}(undef, 8)
+        grants = Vector{Any}(undef, 8)
+        @sync for i in 1:8
+            Threads.@spawn codes[i] = consume_authorization_code!(code_store, code)
+            Threads.@spawn grants[i] = consume_refresh_token_grant!(grant_store, token)
+        end
+        @test count(!isnothing, codes) == 1
+        @test count(!isnothing, grants) == 1
+    end
+    @test isempty(code_store)
+    @test isempty(grant_store)
+end
+
+@testset "Server stores are checked for the traits OAuth relies on" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://as.example", audience = ["https://api.example"],
+        private_key = rsa_pem, alg = :RS256)
+    authenticator = (req, params) -> TokenEndpointClient("c1"; public = true)
+
+    mktempdir() do directory
+        # FileStore has TTL but no cross-process compare-and-swap
+        nonatomic_codes = FileStore{OAuth.AuthorizationCodeRecord}(joinpath(directory, "codes"))
+        @test AbstractStores.supportsttl(nonatomic_codes)
+        @test !AbstractStores.isatomic(nonatomic_codes)
+        @test_throws ArgumentError TokenEndpointConfig(
+            code_store = nonatomic_codes, token_issuer = issuer,
+            client_authenticator = authenticator)
+
+        nonatomic_grants = FileStore{OAuth.RefreshTokenGrantRecord}(joinpath(directory, "grants"))
+        @test_throws ArgumentError TokenEndpointConfig(
+            code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+            client_authenticator = authenticator,
+            allowed_grant_types = ["authorization_code", "refresh_token"],
+            refresh_grant_store = nonatomic_grants)
+
+        # RawCodec has nowhere to put an expiry, so the store reports no TTL
+        nottl_tokens = FileStore{OAuth.AccessTokenRecord}(joinpath(directory, "tokens"); codec = RawCodec())
+        @test !AbstractStores.supportsttl(nottl_tokens)
+        @test_throws ArgumentError TokenEndpointConfig(
+            code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
+            client_authenticator = authenticator, token_store = nottl_tokens)
+    end
 end
 
 @testset "Token endpoint grant type validation" begin

@@ -360,7 +360,7 @@ register_jwks_endpoint!(router, [public_jwk(token_issuer)])
 
 ### JWT Access Token Issuance & Storage
 
-`JWTAccessTokenIssuer` signs tokens, and the optional `AccessTokenStore` captures issued tokens for introspection and revocation. Tokens inherit scopes, authorization details, audiences, confirmation (`cnf`) claims, and extra custom claims in a single call.
+`JWTAccessTokenIssuer` signs tokens, and the optional `AccessTokenStore` captures issued tokens for introspection and revocation. Server stores use the `AbstractStores.jl` interface. The application can therefore choose process memory, files, Redis, SQL, or another conforming backend. Tokens inherit scopes, authorization details, audiences, confirmation (`cnf`) claims, and extra custom claims in a single call.
 
 ```julia
 token_store = InMemoryTokenStore()
@@ -383,6 +383,63 @@ claims = validate_jwt_access_token(issued.token, validator; required_scopes = ["
 ```
 
 `AccessTokenClaims` includes the parsed scope list, audience, confirmation thumbprint, client ID, and raw claims you can use for authorization decisions.
+
+### Choosing a Server State Backend
+
+The three authorization-server stores can share one physical backend. OAuth
+adds separate prefixes for access tokens, authorization codes, and refresh
+grants:
+
+```julia
+using AbstractStores, OAuth
+
+backend = MemoryStore()
+stores = OAuth.authorization_server_stores(backend)
+
+token_store = stores.access_tokens
+code_store = stores.authorization_codes
+refresh_grant_store = stores.refresh_grants
+```
+
+Only the backend construction changes when the state must survive a restart or be
+shared between server processes:
+
+```julia
+backend = RedisStore{Any}(client)      # or SQLStore{Any}(conn)
+stores = OAuth.authorization_server_stores(backend)
+```
+
+`AuthorizationEndpointConfig` and `TokenEndpointConfig` require an atomic,
+TTL-capable authorization-code store, because RFC 6749 §4.1.2 requires a code to
+be redeemable exactly once. `MemoryStore`, `SQLStore`, and `RedisStore` provide
+that guarantee. `FileStore` has no cross-process compare-and-swap, so OAuth
+rejects it for authorization codes at construction time rather than degrading
+silently; it remains valid for access-token state in a single service process.
+
+A shared backend must also hand values back unchanged, which means `MemoryStore`
+or the default `SerializedCodec`. A portable codec such as `JSONCodec` decodes at
+the *backend's* own `eltype`, so records would come back as `Dict{String,Any}`.
+With such a codec, give each kind of state its own concretely typed store instead
+of calling `authorization_server_stores`:
+
+```julia
+token_store = FileStore{OAuth.AccessTokenRecord}(dir; codec = JSONCodec())
+```
+
+Expired entries are always invisible to lookups, but *reclaiming* them is the
+backend's business. Redis and SQL expire rows on their own, while `MemoryStore`
+and `FileStore` only drop an expired entry when something reads it. A
+long-running authorization server on those backends should call
+`AbstractStores.sweep!(backend)` on a timer so unredeemed codes and lapsed tokens
+do not accumulate.
+
+OAuth hashes bearer tokens, authorization codes, and refresh tokens before it
+uses them as store keys. The raw credentials remain inside the stored records.
+They do not appear in filenames or database indexes.
+
+The client-side `RefreshTokenStore` API remains separate. It includes
+configuration-aware lookup and refresh locking that a simple key-value store
+does not model.
 
 ### Protected Resource Middleware
 
