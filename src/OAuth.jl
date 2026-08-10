@@ -60,6 +60,8 @@ export AuthorizationRequestContext, AuthorizationGrantDecision, grant_authorizat
 export AuthorizationCodeStore, AuthorizationCodeRecord, InMemoryAuthorizationCodeStore
 export RefreshTokenGrantStore, RefreshTokenGrantRecord, InMemoryRefreshTokenGrantStore
 export store_refresh_token_grant!, consume_refresh_token_grant!, lookup_refresh_token_grant
+export AuthorizationServerStores, TokenService, IssuedTokenPair
+export issue_token_pair!, refresh_token_pair!, revoke_refresh_token_grant!
 export build_authorization_endpoint, build_token_endpoint, client_credentials_authenticator
 export store_authorization_code!, consume_authorization_code!
 

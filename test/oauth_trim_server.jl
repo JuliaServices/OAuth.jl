@@ -95,10 +95,86 @@ function _trim_rsa_signing()::Nothing
     return nothing
 end
 
+function _trim_token_service()::Nothing
+    now = OAuth.Dates.DateTime(2026, 8, 9, 12, 0, 0)
+    stores = OAuth.AuthorizationServerStores(OAuth.AbstractStores.MemoryStore())
+    issuer = OAuth.JWTAccessTokenIssuer(
+        issuer="https://issuer.example",
+        audience=["https://api.example"],
+        private_key=TRIM_PRIVATE_KEY_DER,
+        alg=:RS256,
+        kid="trim-key",
+        expires_in=600,
+    )
+    service = OAuth.TokenService(
+        stores;
+        issuer,
+        refresh_token_ttl_seconds=3600,
+    )
+    refresh_token, family_id = OAuth._new_refresh_family_token()
+    grant = OAuth.RefreshTokenGrantRecord(
+        refresh_token,
+        "soleil",
+        "user-42",
+        ["solar:read", "solar:write"],
+        String[],
+        nothing,
+        Dict{String,Any}(),
+        now,
+        now + OAuth.Dates.Hour(1),
+    )
+    OAuth._store_refresh_family!(service, family_id, grant; now)
+    _trim_server_assert(
+        OAuth.lookup_refresh_token_grant(service, refresh_token) !== nothing,
+        "service refresh-token lookup",
+    )
+
+    successor_token, successor, granted_scope, _ = OAuth._rotate_refresh_family!(
+        service,
+        refresh_token,
+        "soleil",
+        ["solar:read"],
+        now + OAuth.Dates.Minute(5),
+    )
+    _trim_server_assert(
+        granted_scope == ["solar:read"],
+        "service scope narrowing",
+    )
+    _trim_server_assert(
+        successor.expires_at == grant.expires_at,
+        "service absolute refresh expiry",
+    )
+    _trim_server_assert(
+        OAuth.lookup_refresh_token_grant(service, successor_token) !== nothing,
+        "service refresh-token rotation",
+    )
+
+    replay_rejected = false
+    try
+        OAuth._rotate_refresh_family!(
+            service,
+            refresh_token,
+            "soleil",
+            nothing,
+            now + OAuth.Dates.Minute(6),
+        )
+    catch error
+        error isa OAuth.OAuthError || rethrow()
+        replay_rejected = error.code == :invalid_grant
+    end
+    _trim_server_assert(replay_rejected, "service refresh-token replay")
+    _trim_server_assert(
+        OAuth.lookup_refresh_token_grant(service, successor_token) === nothing,
+        "service refresh family revocation",
+    )
+    return nothing
+end
+
 function run_oauth_trim_server()::Nothing
     _trim_rsa_signing()
     _trim_token_store()
     _trim_authorization_code_store()
+    _trim_token_service()
     return nothing
 end
 

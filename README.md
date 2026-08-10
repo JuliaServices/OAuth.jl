@@ -394,7 +394,7 @@ grants:
 using AbstractStores, OAuth
 
 backend = MemoryStore()
-stores = OAuth.authorization_server_stores(backend)
+stores = OAuth.AuthorizationServerStores(backend)
 
 token_store = stores.access_tokens
 code_store = stores.authorization_codes
@@ -406,8 +406,14 @@ shared between server processes:
 
 ```julia
 backend = RedisStore{Any}(client)      # or SQLStore{Any}(conn)
-stores = OAuth.authorization_server_stores(backend)
+stores = OAuth.AuthorizationServerStores(backend)
 ```
+
+`AuthorizationServerStores` is a typed configuration bundle. It does not own
+the backend. Pass its fields to the endpoint configurations, or pass the bundle
+directly to their convenience constructors. The older
+`authorization_server_stores(backend)` helper remains available and returns the
+same three stores as a named tuple.
 
 `AuthorizationEndpointConfig` and `TokenEndpointConfig` require an atomic,
 TTL-capable authorization-code store, because RFC 6749 §4.1.2 requires a code to
@@ -419,11 +425,14 @@ silently; it remains valid for access-token state in a single service process.
 A shared backend must also hand values back unchanged, which means `MemoryStore`
 or the default `SerializedCodec`. A portable codec such as `JSONCodec` decodes at
 the *backend's* own `eltype`, so records would come back as `Dict{String,Any}`.
-With such a codec, give each kind of state its own concretely typed store instead
-of calling `authorization_server_stores`:
+With such a codec, give each kind of state its own concretely typed store:
 
 ```julia
-token_store = FileStore{OAuth.AccessTokenRecord}(dir; codec = JSONCodec())
+stores = OAuth.AuthorizationServerStores(
+    access_tokens=FileStore{OAuth.AccessTokenRecord}(access_dir; codec=JSONCodec()),
+    authorization_codes=FileStore{OAuth.AuthorizationCodeRecord}(code_dir; codec=JSONCodec()),
+    refresh_grants=FileStore{OAuth.RefreshTokenGrantRecord}(refresh_dir; codec=JSONCodec()),
+)
 ```
 
 Expired entries are always invisible to lookups, but *reclaiming* them is the
@@ -524,23 +533,41 @@ HTTP.register!(router, "POST", "/token", token_endpoint)
 
 You receive a `TokenEndpointClient` describing the authenticated client, and the helper automatically enforces PKCE, validates redirect URIs, and copies authorization details/resource indicators into the response.
 
-To also serve the `refresh_token` grant, add it to `allowed_grant_types` and supply a `refresh_grant_store`. The endpoint then issues a refresh token alongside each access token, remembers what it was granted for, and honours it later:
+To also serve the `refresh_token` grant, combine the issuer and stores in a
+`TokenService`. The service owns access-token persistence, refresh-token
+issuance, rotation, and revocation. The issuer remains responsible only for JWT
+construction and signing:
 
 ```julia
+stores = AuthorizationServerStores(MemoryStore())
+token_service = TokenService(
+    stores;
+    issuer=token_issuer,
+    refresh_token_ttl_seconds=60 * 60 * 24 * 30,
+)
 token_endpoint = build_token_endpoint(
     TokenEndpointConfig(
-        code_store = code_store,
-        token_issuer = token_issuer,
-        client_authenticator = client_auth,
-        token_store = token_store,
-        allowed_grant_types = ["authorization_code", "refresh_token"],
-        refresh_grant_store = InMemoryRefreshTokenGrantStore(),
-        refresh_token_ttl_seconds = 60 * 60 * 24 * 30,  # optional; `nothing` means no expiry
+        stores,
+        token_service;
+        client_authenticator=client_auth,
+        allowed_grant_types=["authorization_code", "refresh_token"],
     ),
 )
 ```
 
-Refresh tokens are **rotated on every use**: redeeming one consumes it and returns a fresh token, so a replayed token fails with `invalid_grant` (RFC 9700 §4.14). The grant is bound to the client it was issued to, honours the configured TTL, and lets clients narrow scope but never widen it (RFC 6749 §6). Supply `refresh_token_generator` if you want to mint the token values yourself; the default draws 32 CSPRNG bytes.
+`TokenService` refresh tokens are **rotated on every use**. A replayed old token
+revokes its active token family and fails with `invalid_grant` (RFC 9700 §4.14).
+The grant is bound to its client, keeps its original absolute expiry, and lets a
+client narrow scope but never widen it (RFC 6749 §6).
+
+Clients must serialize refresh requests and must not retry one blindly after a
+timeout. Reusing the pre-rotation token is treated as a replay and revokes the
+active family. The user must then authenticate again.
+
+The existing keyword-only `TokenEndpointConfig` API remains available for
+custom or opaque refresh-token formats. Those tokens still rotate on every use,
+but they cannot identify and revoke a newer member of the same token family
+after replay.
 
 ### Introspection & Revocation
 
