@@ -117,6 +117,14 @@ function _count_trim_verify_messages(output::String)::Tuple{Int, Int}
     return errors, warnings
 end
 
+function _trim_selected_workloads(workloads::Vector{Tuple{String,String}})
+    only = strip(get(ENV, "OAUTH_TRIM_ONLY", ""))
+    isempty(only) && return workloads
+    selected = filter(workload -> workload[1] == only, workloads)
+    isempty(selected) && throw(ArgumentError("unknown OAUTH_TRIM_ONLY workload: $only"))
+    return selected
+end
+
 function _run_trim_case(project_path::String, script_file::String, output_name::String)
     script_path = joinpath(@__DIR__, script_file)
     @test isfile(script_path)
@@ -193,8 +201,9 @@ end
         project_path = _setup_trim_env()
         trim_workloads = [
             ("oauth_trim_safe.jl", "oauth_trim_safe"),
+            ("oauth_trim_server.jl", "oauth_trim_server"),
         ]
-        for (script_file, output_name) in trim_workloads
+        for (script_file, output_name) in _trim_selected_workloads(trim_workloads)
             _run_trim_case(project_path, script_file, output_name)
         end
     end
