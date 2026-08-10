@@ -553,7 +553,7 @@ function issue_access_token(issuer::JWTAccessTokenIssuer; subject=nothing, clien
     issuer.kid !== nothing && (header["kid"] = issuer.kid)
     token = build_jws_compact(header, claims, issuer.signer, issuer.alg)
     issued = IssuedAccessToken(token, claims, normalize_string_vector(scope), now, expires_at, client_id === nothing ? nothing : String(client_id), subject === nothing ? nothing : String(subject), cnf_thumbprint)
-    store === nothing || store_access_token!(store, issued)
+    store === nothing || store_access_token!(store, issued; now)
     return issued
 end
 
@@ -669,6 +669,31 @@ function put_until!(store::AbstractStore, key::AbstractString, value,
     return value
 end
 
+# A typed view can share a parent whose element type is `Any`. Narrow values at
+# the OAuth boundary so callers and trim compilation still see the record type
+# promised by `AbstractStore{T}`.
+function typed_store_get(store::AbstractStore{T}, key::AbstractString) where {T}
+    value = get(store, key, nothing)
+    value === nothing && return nothing
+    return value::T
+end
+
+function typed_store_modify!(
+    f,
+    store::AbstractStore{T},
+    key::AbstractString;
+    ttl=nothing,
+) where {T}
+    value = AbstractStores.modify!(store, key; ttl) do raw
+        old = raw === nothing ? nothing : raw::T
+        new = f(old)
+        new === nothing && return nothing
+        return new::T
+    end
+    value === nothing && return nothing
+    return value::T
+end
+
 """
     store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken; now=Dates.now(UTC))
 
@@ -702,7 +727,7 @@ Fetches a previously stored token record or returns `nothing` if the token
 is unknown (or revoked).
 """
 lookup_access_token(store::AccessTokenStore, token::AbstractString) =
-    get(store, state_key(token), nothing)
+    typed_store_get(store, state_key(token))
 
 """
     revoke_access_token!(store::AccessTokenStore, token::AbstractString)
@@ -969,7 +994,85 @@ Returns a refresh token grant without consuming it.
 """
 lookup_refresh_token_grant(store::RefreshTokenGrantStore,
                            token::AbstractString) =
-    get(store, state_key(token), nothing)
+    typed_store_get(store, state_key(token))
+
+"""
+    AuthorizationServerStores
+
+A concrete bundle of the three logical stores used by an OAuth authorization
+server. The stores may be typed views over one shared backend or independent
+stores chosen for their different persistence and atomicity requirements.
+"""
+struct AuthorizationServerStores{
+    A<:AccessTokenStore,
+    C<:AuthorizationCodeStore,
+    R<:RefreshTokenGrantStore,
+}
+    access_tokens::A
+    authorization_codes::C
+    refresh_grants::R
+end
+
+"""
+    AuthorizationServerStores(backend)
+
+Create typed, prefixed access-token, authorization-code, and refresh-grant
+stores over one generic backend.
+
+The backend must be wide enough to hold all three OAuth record types and must
+return stored values without changing their types. Use the keyword constructor
+with three independently typed stores when the backend codec cannot provide
+that guarantee.
+"""
+function AuthorizationServerStores(backend::AbstractStore)
+    for T in (AccessTokenRecord, AuthorizationCodeRecord, RefreshTokenGrantRecord)
+        eltype(backend) >: T || throw(ArgumentError(
+            "AuthorizationServerStores needs a backend whose eltype can hold $T; " *
+            "got $(typeof(backend)) with eltype $(eltype(backend)). Pass a store " *
+            "parameterized on `Any`, or build one typed store per record type."))
+    end
+    return AuthorizationServerStores(
+        PrefixedStore{AccessTokenRecord}(backend, "oauth/access/"),
+        PrefixedStore{AuthorizationCodeRecord}(backend, "oauth/code/"),
+        PrefixedStore{RefreshTokenGrantRecord}(backend, "oauth/refresh/"),
+    )
+end
+
+function AuthorizationServerStores(;
+    access_tokens,
+    authorization_codes,
+    refresh_grants,
+)
+    access_tokens isa AccessTokenStore ||
+        throw(ArgumentError("access_tokens must implement AccessTokenStore"))
+    authorization_codes isa AuthorizationCodeStore ||
+        throw(ArgumentError("authorization_codes must implement AuthorizationCodeStore"))
+    refresh_grants isa RefreshTokenGrantStore ||
+        throw(ArgumentError("refresh_grants must implement RefreshTokenGrantStore"))
+    return AuthorizationServerStores(
+        access_tokens,
+        authorization_codes,
+        refresh_grants,
+    )
+end
+
+function AuthorizationEndpointConfig(
+    stores::AuthorizationServerStores;
+    redirect_uri_resolver,
+    consent_handler,
+    code_ttl_seconds::Integer=600,
+    require_pkce::Bool=true,
+    allowed_code_challenge_methods=["S256"],
+)
+    return AuthorizationEndpointConfig(;
+        code_store=stores.authorization_codes,
+        redirect_uri_resolver,
+        consent_handler,
+        code_ttl_seconds,
+        require_pkce,
+        allowed_code_challenge_methods,
+    )
+end
 
 """
     authorization_server_stores(backend) -> (; access_tokens, authorization_codes, refresh_grants)
@@ -1014,6 +1117,379 @@ function authorization_server_stores(backend::AbstractStore)
     )
 end
 
+const REFRESH_TOKEN_FAMILY_PREFIX = "oauth-rt1"
+
+"""
+    TokenService
+
+Combines a [`JWTAccessTokenIssuer`](@ref) with the typed stores used to issue,
+look up, revoke, and refresh access tokens. Refresh tokens minted by this
+service rotate within one stored token family so replaying an older generation
+revokes the active family.
+"""
+struct TokenService{
+    A<:AccessTokenStore,
+    R<:RefreshTokenGrantStore,
+}
+    issuer::JWTAccessTokenIssuer
+    access_tokens::A
+    refresh_grants::R
+    refresh_token_ttl::Union{Dates.Second,Nothing}
+end
+
+"""
+    TokenService(; issuer, access_tokens, refresh_grants,
+                 refresh_token_ttl_seconds=nothing)
+
+Create a token service and validate the guarantees required from its stores.
+Access-token records require TTL support. Refresh-token rotation requires
+atomic modification and additionally requires TTL support when a finite
+refresh-token lifetime is configured.
+"""
+function TokenService(;
+    issuer,
+    access_tokens,
+    refresh_grants,
+    refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing,
+)
+    issuer isa JWTAccessTokenIssuer ||
+        throw(ArgumentError("issuer must be a JWTAccessTokenIssuer"))
+    access_tokens isa AccessTokenStore ||
+        throw(ArgumentError("access_tokens must implement AccessTokenStore"))
+    refresh_grants isa RefreshTokenGrantStore ||
+        throw(ArgumentError("refresh_grants must implement RefreshTokenGrantStore"))
+    ttl = refresh_token_ttl_seconds === nothing ?
+        nothing : Dates.Second(Int(refresh_token_ttl_seconds))
+    ttl !== nothing && Dates.value(ttl) <= 0 &&
+        throw(ArgumentError("refresh_token_ttl_seconds must be positive"))
+    AbstractStores.checkstore(access_tokens; ttl=true)
+    AbstractStores.checkstore(
+        refresh_grants;
+        atomic=true,
+        ttl=(ttl !== nothing),
+    )
+    return TokenService(issuer, access_tokens, refresh_grants, ttl)
+end
+
+TokenService(
+    stores::AuthorizationServerStores;
+    issuer,
+    refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing,
+) = TokenService(;
+    issuer,
+    access_tokens=stores.access_tokens,
+    refresh_grants=stores.refresh_grants,
+    refresh_token_ttl_seconds,
+)
+
+"""
+    IssuedTokenPair
+
+The access token and rotating refresh-token grant returned by
+[`issue_token_pair!`](@ref) and [`refresh_token_pair!`](@ref).
+"""
+struct IssuedTokenPair
+    access_token::IssuedAccessToken
+    refresh_token::String
+    refresh_grant::RefreshTokenGrantRecord
+end
+
+function issue_access_token(
+    service::TokenService;
+    subject=nothing,
+    client_id=nothing,
+    scope=String[],
+    authorization_details=nothing,
+    extra_claims=Dict{String,Any}(),
+    audience=nothing,
+    now::DateTime=Dates.now(UTC),
+    confirmation=nothing,
+    confirmation_jkt=nothing,
+)
+    return issue_access_token(
+        service.issuer;
+        subject,
+        client_id,
+        scope,
+        authorization_details,
+        extra_claims,
+        audience,
+        now,
+        store=service.access_tokens,
+        confirmation,
+        confirmation_jkt,
+    )
+end
+
+function _new_refresh_family_token(family_id::Union{String,Nothing}=nothing)
+    family = family_id === nothing ? random_state(bytes=32) : family_id
+    secret = random_state(bytes=32)
+    return "$(REFRESH_TOKEN_FAMILY_PREFIX).$(family).$(secret)", family
+end
+
+function _parse_refresh_family_token(token::AbstractString)
+    parts = split(String(token), '.'; limit=3)
+    length(parts) == 3 || return nothing
+    parts[1] == REFRESH_TOKEN_FAMILY_PREFIX || return nothing
+    isempty(parts[2]) && return nothing
+    isempty(parts[3]) && return nothing
+    return (family_id=String(parts[2]), secret=String(parts[3]))
+end
+
+_refresh_family_key(family_id::AbstractString) = state_key(family_id)
+
+function _refresh_expiry(service::TokenService, now::DateTime)
+    return service.refresh_token_ttl === nothing ?
+        nothing : now + service.refresh_token_ttl
+end
+
+function _store_refresh_family!(
+    service::TokenService,
+    family_id::String,
+    record::RefreshTokenGrantRecord;
+    now::DateTime,
+)
+    key = _refresh_family_key(family_id)
+    if record.expires_at === nothing
+        put!(service.refresh_grants, key, record)
+    else
+        put_until!(
+            service.refresh_grants,
+            key,
+            record,
+            record.expires_at,
+            now,
+        )
+    end
+    return record
+end
+
+"""
+    issue_token_pair!(service; client_id, subject=nothing, scope=[],
+                      resource=[], authorization_details=nothing,
+                      extra_claims=Dict(), audience=nothing,
+                      now=Dates.now(UTC)) -> IssuedTokenPair
+
+Issue and persist an access token plus a rotating refresh token. `client_id` is
+required because every refresh grant is bound to the client that received it.
+"""
+function issue_token_pair!(
+    service::TokenService;
+    client_id::AbstractString,
+    subject=nothing,
+    scope=String[],
+    resource=String[],
+    authorization_details=nothing,
+    extra_claims=Dict{String,Any}(),
+    audience=nothing,
+    now::DateTime=Dates.now(UTC),
+)
+    client = String(client_id)
+    isempty(client) && throw(ArgumentError("client_id must not be empty"))
+    granted_scope = normalize_string_vector(scope)
+    granted_resource = normalize_string_vector(resource)
+    refresh_token, family_id = _new_refresh_family_token()
+    refresh_grant = RefreshTokenGrantRecord(
+        refresh_token,
+        client,
+        subject === nothing ? nothing : String(subject),
+        granted_scope,
+        granted_resource,
+        authorization_details,
+        Dict{String,Any}(extra_claims),
+        now,
+        _refresh_expiry(service, now),
+    )
+    access_token = issue_access_token(
+        service;
+        subject,
+        client_id=client,
+        scope=granted_scope,
+        authorization_details,
+        extra_claims,
+        audience,
+        now,
+    )
+    try
+        _store_refresh_family!(service, family_id, refresh_grant; now)
+    catch
+        revoke_access_token!(service.access_tokens, access_token.token)
+        rethrow()
+    end
+    return IssuedTokenPair(access_token, refresh_token, refresh_grant)
+end
+
+function lookup_access_token(service::TokenService, token::AbstractString)
+    return lookup_access_token(service.access_tokens, token)
+end
+
+function lookup_refresh_token_grant(
+    service::TokenService,
+    token::AbstractString,
+)
+    parsed = _parse_refresh_family_token(token)
+    parsed === nothing && return nothing
+    record = typed_store_get(
+        service.refresh_grants,
+        _refresh_family_key(parsed.family_id),
+    )
+    record === nothing && return nothing
+    return secure_compare(record.token, String(token)) ? record : nothing
+end
+
+function _rotate_refresh_family!(
+    service::TokenService,
+    refresh_token::AbstractString,
+    client_id::AbstractString,
+    scope,
+    now::DateTime,
+)
+    token = String(refresh_token)
+    parsed = _parse_refresh_family_token(token)
+    parsed === nothing && throw(OAuthError(:invalid_grant, "invalid refresh token"))
+    key = _refresh_family_key(parsed.family_id)
+    current = typed_store_get(service.refresh_grants, key)
+    current === nothing && throw(OAuthError(
+        :invalid_grant,
+        "refresh token is invalid or has already been used",
+    ))
+
+    client = String(client_id)
+    current.client_id == client || throw(OAuthError(
+        :invalid_grant,
+        "refresh token was issued to a different client",
+    ))
+    granted_scope = if scope === nothing
+        copy(current.scope)
+    else
+        requested = normalize_string_vector(scope)
+        extra = [item for item in requested if !(item in current.scope)]
+        isempty(extra) || throw(OAuthError(
+            :invalid_scope,
+            "requested scope exceeds the original grant: $(join(sort(extra), ", "))",
+        ))
+        requested
+    end
+
+    successor_token, _ = _new_refresh_family_token(parsed.family_id)
+    outcome = Ref(:missing)
+    successor = Ref{Union{RefreshTokenGrantRecord,Nothing}}(nothing)
+    remaining_ttl = current.expires_at === nothing ?
+        nothing : current.expires_at - now
+    if remaining_ttl !== nothing && remaining_ttl <= Dates.Millisecond(0)
+        remaining_ttl = nothing
+    end
+    typed_store_modify!(
+        service.refresh_grants,
+        key;
+        ttl=remaining_ttl,
+    ) do stored
+        if stored === nothing
+            outcome[] = :missing
+            return nothing
+        elseif stored.client_id != client
+            outcome[] = :wrong_client
+            return stored
+        elseif stored.expires_at !== nothing && stored.expires_at <= now
+            outcome[] = :expired
+            return nothing
+        elseif !secure_compare(stored.token, token)
+            outcome[] = :replayed
+            return nothing
+        end
+        next_record = RefreshTokenGrantRecord(
+            successor_token,
+            stored.client_id,
+            stored.subject,
+            copy(stored.scope),
+            copy(stored.resource),
+            stored.authorization_details,
+            Dict{String,Any}(stored.extra_claims),
+            now,
+            stored.expires_at,
+        )
+        successor[] = next_record
+        outcome[] = :rotated
+        return next_record
+    end
+
+    outcome[] == :rotated || throw(OAuthError(
+        :invalid_grant,
+        outcome[] == :wrong_client ?
+            "refresh token was issued to a different client" :
+        outcome[] == :expired ?
+            "refresh token expired" :
+            "refresh token is invalid or has already been used",
+    ))
+    return (
+        successor_token,
+        something(successor[]),
+        granted_scope,
+        key,
+    )
+end
+
+"""
+    refresh_token_pair!(service, refresh_token; client_id, scope=nothing,
+                        extra_claims=Dict(), audience=nothing,
+                        now=Dates.now(UTC)) -> IssuedTokenPair
+
+Atomically rotate a refresh token and issue a new access token. Replaying an
+older token generation revokes the active token family. A requested scope may
+narrow, but never widen, the original grant. If access-token issuance fails
+after rotation, the service revokes the refresh family so it cannot return a
+partially issued token pair.
+"""
+function refresh_token_pair!(
+    service::TokenService,
+    refresh_token::AbstractString;
+    client_id::AbstractString,
+    scope=nothing,
+    extra_claims=Dict{String,Any}(),
+    audience=nothing,
+    now::DateTime=Dates.now(UTC),
+)
+    successor_token, refresh_grant, granted_scope, key =
+        _rotate_refresh_family!(service, refresh_token, client_id, scope, now)
+    access_claims = Dict{String,Any}(refresh_grant.extra_claims)
+    for (claim, value) in extra_claims
+        access_claims[String(claim)] = value
+    end
+    access_token = try
+        issue_access_token(
+            service;
+            subject=refresh_grant.subject,
+            client_id=refresh_grant.client_id,
+            scope=granted_scope,
+            authorization_details=refresh_grant.authorization_details,
+            extra_claims=access_claims,
+            audience,
+            now,
+        )
+    catch
+        delete!(service.refresh_grants, key)
+        rethrow()
+    end
+    return IssuedTokenPair(access_token, successor_token, refresh_grant)
+end
+
+"""Revoke the complete refresh-token family containing `token`."""
+function revoke_refresh_token_grant!(
+    service::TokenService,
+    token::AbstractString,
+)
+    parsed = _parse_refresh_family_token(token)
+    parsed === nothing && return false
+    return pop!(
+        service.refresh_grants,
+        _refresh_family_key(parsed.family_id),
+        nothing,
+    ) !== nothing
+end
+
+revoke_access_token!(service::TokenService, token::AbstractString) =
+    revoke_access_token!(service.access_tokens, token)
+
 const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code", "refresh_token"])
 
 """
@@ -1021,7 +1497,8 @@ const SUPPORTED_TOKEN_ENDPOINT_GRANT_TYPES = Set(["authorization_code", "refresh
 
 Holds everything the built-in token endpoint needs: the authorization code
 store, token issuer, client authenticator, refresh token generator, extra
-claims callback, optional persistent token store, and allowed grant types.
+claims callback, optional persistent token store, allowed grant types, and an
+optional [`TokenService`](@ref) for family-aware refresh-token rotation.
 """
 struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:Function}
     code_store::S
@@ -1033,10 +1510,17 @@ struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:
     allowed_grant_types::Set{String}
     refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}
     refresh_token_ttl::Union{Dates.Second,Nothing}
+    token_service::Union{TokenService,Nothing}
 end
 
 """
-    TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store=nothing, refresh_token_ttl_seconds=nothing)
+    TokenEndpointConfig(; code_store, token_issuer, client_authenticator,
+                        token_store=nothing, refresh_token_generator=nothing,
+                        extra_token_claims=nothing,
+                        allowed_grant_types=["authorization_code"],
+                        refresh_grant_store=nothing,
+                        refresh_token_ttl_seconds=nothing,
+                        token_service=nothing)
 
 Validates and normalizes the callbacks before handing the struct to
 [`build_token_endpoint`](@ref).
@@ -1046,18 +1530,46 @@ To support the `refresh_token` grant, add it to `allowed_grant_types` and supply
 endpoint then issues a refresh token alongside each access token and honours it
 later.  `refresh_token_ttl_seconds` bounds how long a refresh token stays valid
 (`nothing` means no expiry).  Refresh tokens are rotated on every use.
+
+When `token_service` is supplied, the endpoint uses its access-token and
+refresh-grant stores and its replay-detecting token-family rotation. A custom
+`refresh_token_generator` is not accepted in this mode because the service owns
+the structured refresh-token format.
 """
-function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, token_store::Union{AccessTokenStore,Nothing}=nothing, refresh_token_generator=nothing, extra_token_claims=nothing, allowed_grant_types=["authorization_code"], refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}=nothing, refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing)
+function TokenEndpointConfig(;
+    code_store,
+    token_issuer,
+    client_authenticator,
+    token_store::Union{AccessTokenStore,Nothing}=nothing,
+    refresh_token_generator=nothing,
+    extra_token_claims=nothing,
+    allowed_grant_types=["authorization_code"],
+    refresh_grant_store::Union{RefreshTokenGrantStore,Nothing}=nothing,
+    refresh_token_ttl_seconds::Union{Integer,Nothing}=nothing,
+    token_service=nothing,
+)
     code_store isa AuthorizationCodeStore || throw(ArgumentError("code_store must implement AuthorizationCodeStore"))
     # single-use redemption needs a real compare-and-swap, and codes must expire
     AbstractStores.checkstore(code_store; atomic=true, ttl=true)
     token_issuer isa JWTAccessTokenIssuer || throw(ArgumentError("token_issuer must be a JWTAccessTokenIssuer"))
     client_authenticator isa Function || throw(ArgumentError("client_authenticator must be callable"))
+    if token_service !== nothing
+        token_service isa TokenService ||
+            throw(ArgumentError("token_service must be a TokenService"))
+        token_service.issuer === token_issuer || throw(ArgumentError(
+            "token_service and token_issuer must use the same issuer"))
+        refresh_token_generator === nothing || throw(ArgumentError(
+            "token_service owns refresh-token generation; do not pass refresh_token_generator"))
+        token_store === nothing || token_store === token_service.access_tokens ||
+            throw(ArgumentError("token_store must match token_service.access_tokens"))
+        refresh_grant_store === nothing ||
+            refresh_grant_store === token_service.refresh_grants ||
+            throw(ArgumentError("refresh_grant_store must match token_service.refresh_grants"))
+        token_store = token_service.access_tokens
+        refresh_grant_store = token_service.refresh_grants
+    end
     # every access-token record is written with an expiry derived from its `exp`
     token_store === nothing || AbstractStores.checkstore(token_store; ttl=true)
-    default_refresh = refresh_grant_store === nothing ? (_record, _client) -> nothing : (_record, _client) -> random_state(bytes=32)
-    refresh_fn = refresh_token_generator === nothing ? default_refresh : refresh_token_generator
-    extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
     allowed = Set(lowercase.(String.(allowed_grant_types)))
     isempty(allowed) && throw(ArgumentError("allowed_grant_types must not be empty"))
     # reject grant types the handler cannot serve, rather than accepting them here and
@@ -1067,14 +1579,59 @@ function TokenEndpointConfig(; code_store, token_issuer, client_authenticator, t
     if "refresh_token" in allowed && refresh_grant_store === nothing
         throw(ArgumentError("the refresh_token grant requires a refresh_grant_store (for example InMemoryRefreshTokenGrantStore())"))
     end
-    ttl = refresh_token_ttl_seconds === nothing ? nothing : Dates.Second(Int(refresh_token_ttl_seconds))
+    default_refresh = (
+        refresh_grant_store === nothing || !("refresh_token" in allowed)
+    ) ? (_record, _client) -> nothing : (_record, _client) -> random_state(bytes=32)
+    refresh_fn = refresh_token_generator === nothing ? default_refresh : refresh_token_generator
+    extra_fn = extra_token_claims === nothing ? (_record, _client) -> Dict{String,Any}() : extra_token_claims
+    ttl = if token_service === nothing
+        refresh_token_ttl_seconds === nothing ?
+            nothing : Dates.Second(Int(refresh_token_ttl_seconds))
+    else
+        requested_ttl = refresh_token_ttl_seconds === nothing ?
+            token_service.refresh_token_ttl :
+            Dates.Second(Int(refresh_token_ttl_seconds))
+        requested_ttl == token_service.refresh_token_ttl || throw(ArgumentError(
+            "refresh_token_ttl_seconds must match token_service"))
+        requested_ttl
+    end
     ttl !== nothing && Dates.value(ttl) <= 0 && throw(ArgumentError("refresh_token_ttl_seconds must be positive"))
     # rotation consumes the grant, so it needs the same single-use guarantee;
     # TTL only matters when refresh tokens are given a finite lifetime
     refresh_grant_store === nothing ||
         AbstractStores.checkstore(refresh_grant_store; atomic=true, ttl=(ttl !== nothing))
-    return TokenEndpointConfig(code_store, token_issuer, client_authenticator, refresh_fn, extra_fn, token_store, allowed, refresh_grant_store, ttl)
+    return TokenEndpointConfig(
+        code_store,
+        token_issuer,
+        client_authenticator,
+        refresh_fn,
+        extra_fn,
+        token_store,
+        allowed,
+        refresh_grant_store,
+        ttl,
+        token_service,
+    )
 end
+
+TokenEndpointConfig(stores::AuthorizationServerStores; kwargs...) =
+    TokenEndpointConfig(;
+        code_store=stores.authorization_codes,
+        token_store=stores.access_tokens,
+        refresh_grant_store=stores.refresh_grants,
+        kwargs...,
+    )
+
+TokenEndpointConfig(
+    stores::AuthorizationServerStores,
+    service::TokenService;
+    kwargs...,
+) = TokenEndpointConfig(;
+    code_store=stores.authorization_codes,
+    token_issuer=service.issuer,
+    token_service=service,
+    kwargs...,
+)
 
 """
     client_credentials_authenticator(credentials; allow_public=false) -> Function
@@ -1348,15 +1905,41 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     for (k, v) in custom_claims
         extra_claims[String(k)] = v
     end
-    issued = issue_access_token(
-        config.token_issuer;
-        subject = record.subject,
-        client_id = record.client_id,
-        scope = record.scope,
-        authorization_details = record.authorization_details,
-        extra_claims = extra_claims,
-        store = config.token_store,
-    )
+    pair = nothing
+    issued = if config.token_service === nothing
+        issue_access_token(
+            config.token_issuer;
+            subject=record.subject,
+            client_id=record.client_id,
+            scope=record.scope,
+            authorization_details=record.authorization_details,
+            extra_claims,
+            store=config.token_store,
+            now=now_time,
+        )
+    elseif "refresh_token" in config.allowed_grant_types
+        pair = issue_token_pair!(
+            config.token_service;
+            client_id=record.client_id,
+            subject=record.subject,
+            scope=record.scope,
+            resource=record.resource,
+            authorization_details=record.authorization_details,
+            extra_claims,
+            now=now_time,
+        )
+        pair.access_token
+    else
+        issue_access_token(
+            config.token_service;
+            subject=record.subject,
+            client_id=record.client_id,
+            scope=record.scope,
+            authorization_details=record.authorization_details,
+            extra_claims,
+            now=now_time,
+        )
+    end
     response = Dict{String,Any}(
         "access_token" => issued.token,
         "token_type" => "Bearer",
@@ -1365,8 +1948,11 @@ function handle_authorization_code_grant(config::TokenEndpointConfig, req::HTTP.
     !isempty(record.scope) && (response["scope"] = join(record.scope, ' '))
     record.authorization_details !== nothing && (response["authorization_details"] = record.authorization_details)
     !isempty(record.resource) && (response["resource"] = record.resource)
-    refresh_token = config.refresh_token_generator(record, client)
-    if refresh_token !== nothing
+    if pair !== nothing
+        response["refresh_token"] = pair.refresh_token
+    else
+        refresh_token = config.refresh_token_generator(record, client)
+        refresh_token === nothing && return token_success_response(response)
         response["refresh_token"] = String(refresh_token)
         persist_refresh_grant!(config, String(refresh_token), client.client_id, record.subject, record.scope, record.resource, record.authorization_details, extra_claims, now_time)
     end
@@ -1382,10 +1968,23 @@ function token_success_response(response::Dict{String,Any})
     return HTTP.Response(200, headers, JSON.json(response))
 end
 
-function persist_refresh_grant!(config::TokenEndpointConfig, token::String, client_id, subject, scope, resource, authorization_details, extra_claims, now::DateTime)
+function persist_refresh_grant!(
+    config::TokenEndpointConfig,
+    token::String,
+    client_id,
+    subject,
+    scope,
+    resource,
+    authorization_details,
+    extra_claims,
+    now::DateTime;
+    expires_at=missing,
+)
     store = config.refresh_grant_store
     store === nothing && return nothing
-    expires_at = config.refresh_token_ttl === nothing ? nothing : now + config.refresh_token_ttl
+    deadline = expires_at === missing ?
+        (config.refresh_token_ttl === nothing ? nothing : now + config.refresh_token_ttl) :
+        expires_at
     record = RefreshTokenGrantRecord(
         token,
         String(client_id),
@@ -1395,10 +1994,58 @@ function persist_refresh_grant!(config::TokenEndpointConfig, token::String, clie
         authorization_details,
         Dict{String,Any}(extra_claims),
         now,
-        expires_at,
+        deadline,
     )
     store_refresh_token_grant!(store, record; now=now)
     return record
+end
+
+function handle_token_service_refresh(
+    config::TokenEndpointConfig,
+    client::TokenEndpointClient,
+    token_value::String,
+    params::Dict{String,String},
+    now_time::DateTime,
+)
+    service = config.token_service
+    service === nothing && error("token service is not configured")
+    # Read only immutable grant metadata for the application's claims callback.
+    # The atomic rotation below remains the authority on whether the token wins.
+    active_record = lookup_refresh_token_grant(service, token_value)
+    custom_claims = Dict{String,Any}()
+    if active_record !== nothing && active_record.client_id == client.client_id
+        for (key, value) in config.extra_token_claims(active_record, client)
+            custom_claims[String(key)] = value
+        end
+    end
+    requested_scope = get(params, "scope", nothing)
+    scope = requested_scope === nothing ? nothing : parse_scope_list(requested_scope)
+    pair = try
+        refresh_token_pair!(
+            service,
+            token_value;
+            client_id=client.client_id,
+            scope,
+            extra_claims=custom_claims,
+            now=now_time,
+        )
+    catch error
+        error isa OAuthError || rethrow()
+        return token_error_response(String(error.code), error.message)
+    end
+    response = Dict{String,Any}(
+        "access_token" => pair.access_token.token,
+        "token_type" => "Bearer",
+        "expires_in" => service.issuer.expires_in,
+        "refresh_token" => pair.refresh_token,
+    )
+    !isempty(pair.access_token.scope) &&
+        (response["scope"] = join(pair.access_token.scope, ' '))
+    grant = pair.refresh_grant
+    grant.authorization_details !== nothing &&
+        (response["authorization_details"] = grant.authorization_details)
+    !isempty(grant.resource) && (response["resource"] = grant.resource)
+    return token_success_response(response)
 end
 
 function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Request, params::Dict{String,String})
@@ -1421,9 +2068,19 @@ function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Reque
         end
     end
     client isa TokenEndpointClient || throw(ArgumentError("client_authenticator must return TokenEndpointClient"))
+    now_time = Dates.now(UTC)
+    if config.token_service !== nothing &&
+       _parse_refresh_family_token(token_value) !== nothing
+        return handle_token_service_refresh(
+            config,
+            client,
+            String(token_value),
+            params,
+            now_time,
+        )
+    end
     record = lookup_refresh_token_grant(store, token_value)
     record === nothing && return token_error_response("invalid_grant", "refresh token is invalid or has already been used")
-    now_time = Dates.now(UTC)
     if record.expires_at !== nothing && now_time > record.expires_at
         consume_refresh_token_grant!(store, token_value)
         return token_error_response("invalid_grant", "refresh token expired")
@@ -1471,7 +2128,19 @@ function handle_refresh_token_grant(config::TokenEndpointConfig, req::HTTP.Reque
     new_refresh = config.refresh_token_generator(record, client)
     if new_refresh !== nothing
         response["refresh_token"] = String(new_refresh)
-        persist_refresh_grant!(config, String(new_refresh), record.client_id, record.subject, record.scope, record.resource, record.authorization_details, record.extra_claims, now_time)
+        next_expiry = record.expires_at === nothing ? missing : record.expires_at
+        persist_refresh_grant!(
+            config,
+            String(new_refresh),
+            record.client_id,
+            record.subject,
+            record.scope,
+            record.resource,
+            record.authorization_details,
+            record.extra_claims,
+            now_time;
+            expires_at=next_expiry,
+        )
     end
     return token_success_response(response)
 end

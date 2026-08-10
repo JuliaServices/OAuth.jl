@@ -2159,9 +2159,21 @@ end
 @testset "AbstractStores authorization-server state" begin
     backend = MemoryStore()
     stores = OAuth.authorization_server_stores(backend)
+    @test stores isa NamedTuple
     @test stores.access_tokens isa OAuth.AccessTokenStore
     @test stores.authorization_codes isa OAuth.AuthorizationCodeStore
     @test stores.refresh_grants isa OAuth.RefreshTokenGrantStore
+
+    typed_stores = AuthorizationServerStores(backend)
+    @test typed_stores.access_tokens isa OAuth.AccessTokenStore
+    @test typed_stores.authorization_codes isa OAuth.AuthorizationCodeStore
+    @test typed_stores.refresh_grants isa OAuth.RefreshTokenGrantStore
+    independent_stores = AuthorizationServerStores(;
+        access_tokens=InMemoryTokenStore(),
+        authorization_codes=InMemoryAuthorizationCodeStore(),
+        refresh_grants=InMemoryRefreshTokenGrantStore(),
+    )
+    @test independent_stores isa AuthorizationServerStores
 
     now_time = Dates.now(UTC)
     long_token = repeat("jwt-segment.", 80)
@@ -2229,6 +2241,194 @@ end
     # a backend that cannot hold every record type is rejected up front rather
     # than failing on the first `put!` with a `convert` error
     @test_throws ArgumentError OAuth.authorization_server_stores(MemoryStore{String}())
+    @test_throws ArgumentError AuthorizationServerStores(MemoryStore{String}())
+end
+
+@testset "TokenService issuance and refresh families" begin
+    stores = AuthorizationServerStores(MemoryStore())
+    issuer = JWTAccessTokenIssuer(
+        issuer="https://as.example",
+        audience=["https://api.example"],
+        private_key=fixture_string("rsa_private.pem"),
+        alg=:RS256,
+        kid="service-key",
+    )
+    service = TokenService(
+        stores;
+        issuer,
+        refresh_token_ttl_seconds=3600,
+    )
+    resolver = (_request, _client, redirect) -> redirect
+    consent = (_request, _context) -> grant_authorization("user-1")
+    @test AuthorizationEndpointConfig(
+        stores;
+        redirect_uri_resolver=resolver,
+        consent_handler=consent,
+    ) isa AuthorizationEndpointConfig
+    @test TokenEndpointConfig(
+        stores;
+        token_issuer=issuer,
+        client_authenticator=(_request, _params) ->
+            TokenEndpointClient("client-1"; public=true),
+    ) isa TokenEndpointConfig
+    @test_throws ArgumentError TokenEndpointConfig(
+        stores,
+        service;
+        client_authenticator=(_request, _params) ->
+            TokenEndpointClient("client-1"; public=true),
+        allowed_grant_types=["authorization_code", "refresh_token"],
+        refresh_token_generator=(_record, _client) -> "custom",
+    )
+    @test_throws ArgumentError TokenEndpointConfig(
+        stores,
+        service;
+        client_authenticator=(_request, _params) ->
+            TokenEndpointClient("client-1"; public=true),
+        allowed_grant_types=["authorization_code", "refresh_token"],
+        refresh_token_ttl_seconds=60,
+    )
+    other_stores = AuthorizationServerStores(MemoryStore())
+    @test_throws ArgumentError TokenEndpointConfig(;
+        code_store=stores.authorization_codes,
+        token_issuer=issuer,
+        client_authenticator=(_request, _params) ->
+            TokenEndpointClient("client-1"; public=true),
+        token_store=other_stores.access_tokens,
+        allowed_grant_types=["authorization_code", "refresh_token"],
+        refresh_grant_store=stores.refresh_grants,
+        token_service=service,
+    )
+    @test_throws ArgumentError TokenEndpointConfig(;
+        code_store=stores.authorization_codes,
+        token_issuer=issuer,
+        client_authenticator=(_request, _params) ->
+            TokenEndpointClient("client-1"; public=true),
+        allowed_grant_types=["authorization_code", "refresh_token"],
+        refresh_grant_store=other_stores.refresh_grants,
+        token_service=service,
+    )
+    now_time = Dates.now(UTC)
+    issued = issue_token_pair!(
+        service;
+        client_id="client-1",
+        subject="user-1",
+        scope=["read", "write"],
+        resource=["https://api.example"],
+        extra_claims=Dict{String,Any}("email" => "user@example.com"),
+        now=now_time,
+    )
+    @test startswith(issued.refresh_token, "oauth-rt1.")
+    @test lookup_access_token(service, issued.access_token.token).subject == "user-1"
+    @test lookup_refresh_token_grant(service, issued.refresh_token).subject == "user-1"
+    original_expiry = issued.refresh_grant.expires_at
+    @test original_expiry == now_time + Dates.Hour(1)
+
+    rotated = refresh_token_pair!(
+        service,
+        issued.refresh_token;
+        client_id="client-1",
+        scope=["read"],
+        extra_claims=Dict{String,Any}("refreshed" => true),
+        now=now_time + Dates.Minute(10),
+    )
+    @test rotated.refresh_token != issued.refresh_token
+    @test rotated.access_token.scope == ["read"]
+    @test rotated.access_token.claims["email"] == "user@example.com"
+    @test rotated.access_token.claims["refreshed"] == true
+    @test rotated.refresh_grant.scope == ["read", "write"]
+    @test rotated.refresh_grant.expires_at == original_expiry
+    @test lookup_refresh_token_grant(service, issued.refresh_token) === nothing
+    @test lookup_refresh_token_grant(service, rotated.refresh_token) !== nothing
+
+    wrong_client = try
+        refresh_token_pair!(
+            service,
+            rotated.refresh_token;
+            client_id="client-2",
+            now=now_time + Dates.Minute(11),
+        )
+        nothing
+    catch error
+        error
+    end
+    @test wrong_client isa OAuthError
+    @test wrong_client.code == :invalid_grant
+    @test lookup_refresh_token_grant(service, rotated.refresh_token) !== nothing
+
+    widened = try
+        refresh_token_pair!(
+            service,
+            rotated.refresh_token;
+            client_id="client-1",
+            scope=["read", "admin"],
+            now=now_time + Dates.Minute(11),
+        )
+        nothing
+    catch error
+        error
+    end
+    @test widened isa OAuthError
+    @test widened.code == :invalid_scope
+    @test lookup_refresh_token_grant(service, rotated.refresh_token) !== nothing
+
+    replay = try
+        refresh_token_pair!(
+            service,
+            issued.refresh_token;
+            client_id="client-1",
+            now=now_time + Dates.Minute(12),
+        )
+        nothing
+    catch error
+        error
+    end
+    @test replay isa OAuthError
+    @test replay.code == :invalid_grant
+    @test lookup_refresh_token_grant(service, rotated.refresh_token) === nothing
+
+    concurrent = issue_token_pair!(
+        service;
+        client_id="client-1",
+        subject="user-1",
+        scope=["read"],
+        now=now_time + Dates.Minute(12),
+    )
+    gate = Base.Event()
+    tasks = [Threads.@spawn begin
+        wait(gate)
+        try
+            refresh_token_pair!(
+                service,
+                concurrent.refresh_token;
+                client_id="client-1",
+                now=now_time + Dates.Minute(13),
+            )
+        catch error
+            error isa OAuthError || rethrow()
+            error
+        end
+    end for _ in 1:16]
+    notify(gate)
+    outcomes = fetch.(tasks)
+    winners = filter(outcome -> outcome isa IssuedTokenPair, outcomes)
+    @test length(winners) == 1
+    @test count(outcome -> outcome isa OAuthError, outcomes) == 15
+    @test lookup_refresh_token_grant(
+        service,
+        only(winners).refresh_token,
+    ) === nothing
+
+    replacement = issue_token_pair!(
+        service;
+        client_id="client-1",
+        subject="user-1",
+        scope=["read"],
+        now=now_time + Dates.Minute(13),
+    )
+    @test revoke_access_token!(service, replacement.access_token.token)
+    @test lookup_access_token(service, replacement.access_token.token) === nothing
+    @test revoke_refresh_token_grant!(service, replacement.refresh_token)
+    @test lookup_refresh_token_grant(service, replacement.refresh_token) === nothing
 end
 
 @testset "Introspection and revocation accept any AccessTokenStore" begin
@@ -2586,6 +2786,39 @@ end
     @test JSON.parse(String(expired.body))["error"] == "invalid_grant"
     @test lookup_refresh_token_grant(grant_store4, "rt-expired") === nothing
 
+    # Rotation keeps the original absolute expiry instead of extending the
+    # grant by a fresh TTL on every use.
+    handler5, _, grant_store5 = build_endpoint(ttl=3600)
+    absolute_expiry = now_time + Dates.Hour(1)
+    store_refresh_token_grant!(grant_store5, OAuth.RefreshTokenGrantRecord(
+        "rt-fixed-expiry", "c1", "user-5", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, absolute_expiry); now=now_time)
+    fixed_expiry_response = handler5(form_request(
+        "grant_type=refresh_token&refresh_token=rt-fixed-expiry",
+    ))
+    fixed_expiry_body = JSON.parse(String(fixed_expiry_response.body))
+    fixed_expiry_grant = lookup_refresh_token_grant(
+        grant_store5,
+        fixed_expiry_body["refresh_token"],
+    )
+    @test fixed_expiry_grant.expires_at == absolute_expiry
+
+    # A legacy unbounded grant acquires the configured endpoint TTL when it is
+    # first rotated after an upgrade.
+    store_refresh_token_grant!(grant_store5, OAuth.RefreshTokenGrantRecord(
+        "rt-add-expiry", "c1", "user-5", ["read"], String[], nothing,
+        Dict{String,Any}(), now_time, nothing))
+    added_expiry_response = handler5(form_request(
+        "grant_type=refresh_token&refresh_token=rt-add-expiry",
+    ))
+    added_expiry_body = JSON.parse(String(added_expiry_response.body))
+    added_expiry_grant = lookup_refresh_token_grant(
+        grant_store5,
+        added_expiry_body["refresh_token"],
+    )
+    @test added_expiry_grant.expires_at !== nothing
+    @test added_expiry_grant.expires_at > now_time
+
     # without the grant in allowed_grant_types the endpoint still refuses it
     plain_cfg = TokenEndpointConfig(
         code_store = InMemoryAuthorizationCodeStore(), token_issuer = issuer,
@@ -2593,6 +2826,115 @@ end
     plain = build_token_endpoint(plain_cfg)
     resp_unsupported = plain(form_request("grant_type=refresh_token&refresh_token=x"))
     @test JSON.parse(String(resp_unsupported.body))["error"] == "unsupported_grant_type"
+
+    # TokenService integrates family-aware rotation with the real token endpoint.
+    service_stores = AuthorizationServerStores(MemoryStore())
+    service = TokenService(service_stores; issuer)
+    service_config = TokenEndpointConfig(
+        service_stores,
+        service;
+        client_authenticator=(req, params) ->
+            TokenEndpointClient("c1"; public=true),
+        allowed_grant_types=["authorization_code", "refresh_token"],
+    )
+    service_handler = build_token_endpoint(service_config)
+    service_code = OAuth.AuthorizationCodeRecord(
+        "service-code",
+        "c1",
+        "https://app/cb",
+        ["read"],
+        "service-user",
+        nothing,
+        nothing,
+        now_time,
+        now_time + Dates.Hour(1),
+        nothing,
+        ["https://api.example"],
+        Dict{String,Any}(),
+    )
+    store_authorization_code!(
+        service_stores.authorization_codes,
+        service_code;
+        now=now_time,
+    )
+    service_response = service_handler(form_request(
+        "grant_type=authorization_code&code=service-code&redirect_uri=$(HTTP.escapeuri("https://app/cb"))",
+    ))
+    @test service_response.status == 200
+    service_body = JSON.parse(String(service_response.body))
+    service_refresh = service_body["refresh_token"]
+    @test startswith(service_refresh, "oauth-rt1.")
+    service_rotated_response = service_handler(form_request(
+        "grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(service_refresh))",
+    ))
+    @test service_rotated_response.status == 200
+    service_rotated = JSON.parse(String(service_rotated_response.body))["refresh_token"]
+    @test service_rotated != service_refresh
+
+    service_replay = service_handler(form_request(
+        "grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(service_refresh))",
+    ))
+    @test JSON.parse(String(service_replay.body))["error"] == "invalid_grant"
+    service_successor = service_handler(form_request(
+        "grant_type=refresh_token&refresh_token=$(HTTP.escapeuri(service_rotated))",
+    ))
+    @test JSON.parse(String(service_successor.body))["error"] == "invalid_grant"
+
+    # The same service can issue and persist access tokens without enabling the
+    # refresh-token grant.
+    access_only_config = TokenEndpointConfig(
+        service_stores,
+        service;
+        client_authenticator=(req, params) ->
+            TokenEndpointClient("c1"; public=true),
+        allowed_grant_types=["authorization_code"],
+    )
+    access_only_handler = build_token_endpoint(access_only_config)
+    access_only_code = OAuth.AuthorizationCodeRecord(
+        "access-only-code",
+        "c1",
+        "https://app/cb",
+        ["read"],
+        "service-user",
+        nothing,
+        nothing,
+        now_time,
+        now_time + Dates.Hour(1),
+        nothing,
+        String[],
+        Dict{String,Any}(),
+    )
+    store_authorization_code!(
+        service_stores.authorization_codes,
+        access_only_code;
+        now=now_time,
+    )
+    access_only_response = access_only_handler(form_request(
+        "grant_type=authorization_code&code=access-only-code&redirect_uri=$(HTTP.escapeuri("https://app/cb"))",
+    ))
+    access_only_body = JSON.parse(String(access_only_response.body))
+    @test access_only_response.status == 200
+    @test !haskey(access_only_body, "refresh_token")
+    @test lookup_access_token(service, access_only_body["access_token"]) !== nothing
+
+    # Existing opaque refresh tokens continue through the legacy endpoint path.
+    legacy_record = OAuth.RefreshTokenGrantRecord(
+        "legacy-refresh",
+        "c1",
+        "legacy-user",
+        ["read"],
+        String[],
+        nothing,
+        Dict{String,Any}(),
+        now_time,
+        nothing,
+    )
+    store_refresh_token_grant!(service_stores.refresh_grants, legacy_record)
+    legacy_response = service_handler(form_request(
+        "grant_type=refresh_token&refresh_token=legacy-refresh",
+    ))
+    @test legacy_response.status == 200
+    @test haskey(JSON.parse(String(legacy_response.body)), "refresh_token")
 end
 @testset "base64url matches the stdlib" begin
     # base64url is hand-rolled to stay resolvable under `--trim=safe`; it must agree
