@@ -1,13 +1,22 @@
-# Internal utilities for JOSE/JWT handling with LibAwsCal backing.
+# Internal utilities for JOSE/JWT handling, backed by JWTs.jl's OpenSSL layer.
+#
+# Key handles are `JWTs.OpenSSLKey` EVP_PKEY wrappers and all signing/verifying
+# goes through JWTs' EVP helpers, so OAuth and JWTs agree byte-for-byte on JOSE
+# semantics (PSS parameters, ECDSA DER<->JOSE conversion, EdDSA raw keys). The
+# only crypto this file implements directly is key *loading* for formats JWTs
+# does not read: DER private keys, raw EC scalars, raw Ed25519 seeds, and
+# public-coordinate extraction for JWK publishing.
 
-using libsodium_jll
+const LIBCRYPTO = OpenSSL_jll.libcrypto
 
-const AwsCommon = LibAwsCal.LibAwsCommon
-const LIBSODIUM = libsodium_jll.libsodium
 const ED25519_PUBLIC_KEY_BYTES = 32
 const ED25519_SECRET_KEY_BYTES = 64
 const ED25519_SIGNATURE_BYTES = 64
 const ED25519_SEED_BYTES = 32
+
+# Stable OpenSSL object NIDs for EVP_PKEY_get_base_id checks.
+const NID_RSA_ENCRYPTION = Cint(6)
+const NID_X9_62_EC = Cint(408)
 
 """
     JWTSigner
@@ -18,44 +27,14 @@ such as [`RequestObjectSigner`](@ref).
 """
 abstract type JWTSigner end
 
-mutable struct RSAKeyHandle
-    ptr::Ptr{aws_rsa_key_pair}
-    function RSAKeyHandle(ptr::Ptr{aws_rsa_key_pair})
-        ptr == C_NULL && error("RSA key pointer must not be null")
-        handle = new(ptr)
-        finalizer(handle) do h
-            if h.ptr != C_NULL
-                aws_rsa_key_pair_release(h.ptr)
-                h.ptr = Ptr{aws_rsa_key_pair}(C_NULL)
-            end
-        end
-        return handle
-    end
-end
-
-mutable struct ECCKeyHandle
-    ptr::Ptr{aws_ecc_key_pair}
-    function ECCKeyHandle(ptr::Ptr{aws_ecc_key_pair})
-        ptr == C_NULL && error("EC key pointer must not be null")
-        handle = new(ptr)
-        finalizer(handle) do h
-            if h.ptr != C_NULL
-                aws_ecc_key_pair_release(h.ptr)
-                h.ptr = Ptr{aws_ecc_key_pair}(C_NULL)
-            end
-        end
-        return handle
-    end
-end
-
 """
     RSASigner
 
-Wraps an AWS-LC RSA key handle and knows which algorithms it supports.
+Wraps an OpenSSL RSA key handle and knows which algorithms it supports.
 Construct instances via [`rsa_signer_from_bytes`](@ref).
 """
 struct RSASigner <: JWTSigner
-    key::RSAKeyHandle
+    key::JWTs.OpenSSLKey
 end
 
 """
@@ -65,18 +44,18 @@ Encapsulates an EC key loaded from PEM/DER bytes together with the curve
 (`:P256` or `:P384`).  Build via [`ecc_signer_from_bytes`](@ref).
 """
 struct ECSigner <: JWTSigner
-    key::ECCKeyHandle
+    key::JWTs.OpenSSLKey
     curve::Symbol        # :P256 or :P384
 end
 
 """
     EdDSASigner
 
-Stores raw Ed25519 secret/public key material for signing with libsodium.
-Construct with [`eddsa_signer_from_bytes`](@ref).
+Holds an Ed25519 key handle together with the raw 32-byte public key for JWK
+publishing.  Construct with [`eddsa_signer_from_bytes`](@ref).
 """
 struct EdDSASigner <: JWTSigner
-    secret::Vector{UInt8}
+    key::JWTs.OpenSSLKey
     public::Vector{UInt8}
 end
 
@@ -90,17 +69,18 @@ abstract type JWTVerifier end
 
 """Verifier for RSA JWTs created via [`rsa_verifier_from_der`](@ref)."""
 struct RSAVerifier <: JWTVerifier
-    key::RSAKeyHandle
+    key::JWTs.OpenSSLKey
 end
 
 """Verifier for `ES256`/`ES384` signatures built from public coordinates."""
 struct ECVerifier <: JWTVerifier
-    key::ECCKeyHandle
+    key::JWTs.OpenSSLKey
     curve::Symbol
 end
 
 """Verifier for `EdDSA` signatures built from a raw 32-byte public key."""
 struct EdDSAVerifier <: JWTVerifier
+    key::JWTs.OpenSSLKey
     public::Vector{UInt8}
 end
 
@@ -108,23 +88,13 @@ const SUPPORTED_RSA_ALGS = Set([:RS256, :PS256])
 const SUPPORTED_EC_ALGS = Set([:ES256, :ES384])
 const SUPPORTED_OKP_ALGS = Set([:EDDSA])
 
-function rsa_signature_algorithm(alg::Symbol)
-    if alg == :RS256
-        return AWS_CAL_RSA_SIGNATURE_PKCS1_5_SHA256
-    elseif alg == :PS256
-        return AWS_CAL_RSA_SIGNATURE_PSS_SHA256
-    else
-        error("Unsupported RSA signature algorithm $(alg)")
-    end
-end
+# OAuth normalizes algorithm symbols to uppercase; JWTs speaks RFC 7518 names.
+jose_alg_name(alg::Symbol) = alg === :EDDSA ? "EdDSA" : String(alg)
 
-function rsa_digest(alg::Symbol, signing_input::Vector{UInt8})
-    if alg in (:RS256, :PS256)
-        return SHA.sha256(signing_input)
-    else
-        error("Unsupported RSA digest for $(alg)")
-    end
-end
+jose_curve_name(curve::Symbol) =
+    curve === :P256 ? "P-256" :
+    curve === :P384 ? "P-384" :
+    error("Unsupported EC curve: $curve")
 
 function decode_pem(data::AbstractString)
     io = IOBuffer()
@@ -143,50 +113,204 @@ normalize_key_bytes(data::AbstractString) = decode_pem(data)
 normalize_key_bytes(data::Vector{UInt8}) = copy(data)
 normalize_key_bytes(data::Base.CodeUnits{UInt8, String}) = normalize_key_bytes(String(data))
 
-const SODIUM_INITIALIZED = Base.RefValue(false)
+# ── key loading ─────────────────────────────────────────────────────────────
 
-function ensure_sodium_initialized()
-    if !SODIUM_INITIALIZED[]
-        result = ccall((:sodium_init, LIBSODIUM), Cint, ())
-        result < 0 && error("sodium_init failed with code $(result)")
-        SODIUM_INITIALIZED[] = true
+"""
+    load_der_private_key(bytes) -> JWTs.OpenSSLKey | nothing
+
+Reads a DER-encoded private key: traditional formats (PKCS#1 RSA, SEC1 EC)
+via `d2i_AutoPrivateKey`, then unencrypted PKCS#8 via `d2i_PKCS8_PRIV_KEY_INFO`.
+Returns `nothing` when OpenSSL cannot parse the bytes as either.
+"""
+function load_der_private_key(bytes::Vector{UInt8})
+    JWTs.clear_openssl_errors()
+    GC.@preserve bytes begin
+        pp = Ref{Ptr{UInt8}}(pointer(bytes))
+        pkey = ccall(
+            (:d2i_AutoPrivateKey, LIBCRYPTO),
+            Ptr{Cvoid},
+            (Ptr{Ptr{Cvoid}}, Ref{Ptr{UInt8}}, Clong),
+            C_NULL,
+            pp,
+            Clong(length(bytes)),
+        )
+        pkey != C_NULL && return JWTs.OpenSSLKey(pkey)
+
+        JWTs.clear_openssl_errors()
+        pp[] = pointer(bytes)
+        p8info = ccall(
+            (:d2i_PKCS8_PRIV_KEY_INFO, LIBCRYPTO),
+            Ptr{Cvoid},
+            (Ptr{Ptr{Cvoid}}, Ref{Ptr{UInt8}}, Clong),
+            C_NULL,
+            pp,
+            Clong(length(bytes)),
+        )
+        p8info == C_NULL && return nothing
+        pkey = ccall((:EVP_PKCS82PKEY, LIBCRYPTO), Ptr{Cvoid}, (Ptr{Cvoid},), p8info)
+        ccall((:PKCS8_PRIV_KEY_INFO_free, LIBCRYPTO), Cvoid, (Ptr{Cvoid},), p8info)
+        pkey == C_NULL && return nothing
+        return JWTs.OpenSSLKey(pkey)
     end
 end
 
-function ed25519_seed_keypair(seed::Vector{UInt8})
-    ensure_sodium_initialized()
+function evp_key_base_id(key::JWTs.OpenSSLKey)
+    return GC.@preserve key ccall((:EVP_PKEY_get_base_id, LIBCRYPTO), Cint, (Ptr{Cvoid},), key.ptr)
+end
+
+"""
+    rsa_signer_from_bytes(data) -> RSASigner
+
+Accepts DER or PEM-encoded PKCS#8/PKCS#1 private keys and returns an
+`RSASigner`.  The helper tries PKCS#8 first, then PKCS#1, and throws a
+helpful error if parsing fails.
+"""
+function rsa_signer_from_bytes(raw)
+    bytes = normalize_key_bytes(raw)
+    key = load_der_private_key(bytes)
+    key === nothing && error("Failed to load RSA private key (expected PKCS#8 or PKCS#1 DER/PEM)")
+    evp_key_base_id(key) == NID_RSA_ENCRYPTION || error("Failed to load RSA private key (expected PKCS#8 or PKCS#1 DER/PEM)")
+    return RSASigner(key)
+end
+
+"""
+    ecc_signer_from_bytes(data, curve::Symbol) -> ECSigner
+
+Loads an EC private key for the provided curve (`:P256` or `:P384`) and
+returns an `ECSigner` ready for JWT signing.
+"""
+function ecc_signer_from_bytes(raw, curve::Symbol)
+    crv = jose_curve_name(curve)
+    bytes = normalize_key_bytes(raw)
+    key = load_der_private_key(bytes)
+    if key !== nothing && evp_key_base_id(key) != NID_X9_62_EC
+        key = nothing
+    end
+    if key === nothing
+        key = ec_key_from_raw_scalar(bytes, crv)
+    end
+    key === nothing && error("Failed to load EC private key for curve $(curve)")
+    return ECSigner(key, curve)
+end
+
+# Raw-scalar fallback: a bare big-endian private scalar for the named curve
+# (the same acceptance the previous aws-c-cal backend provided). The public
+# point is recomputed from the scalar.
+function ec_key_from_raw_scalar(bytes::Vector{UInt8}, crv::AbstractString)
+    field_bytes = crv == "P-256" ? 32 : 48
+    length(bytes) == field_bytes || return nothing
+    priv = Ptr{Cvoid}(C_NULL)
+    ec_key = Ptr{Cvoid}(C_NULL)
+    point = Ptr{Cvoid}(C_NULL)
+    pkey = Ptr{Cvoid}(C_NULL)
+    try
+        priv = JWTs.bn_from_bytes(bytes, "BN_bin2bn(EC scalar)")
+        ec_key = ccall((:EC_KEY_new_by_curve_name, LIBCRYPTO), Ptr{Cvoid}, (Cint,), JWTs.ec_group_nid(crv))
+        JWTs.require_openssl_nonnull(ec_key, "EC_KEY_new_by_curve_name")
+        JWTs.require_openssl_ok(
+            ccall((:EC_KEY_set_private_key, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), ec_key, priv),
+            "EC_KEY_set_private_key",
+        )
+        group = ccall((:EC_KEY_get0_group, LIBCRYPTO), Ptr{Cvoid}, (Ptr{Cvoid},), ec_key)
+        JWTs.require_openssl_nonnull(group, "EC_KEY_get0_group")
+        point = ccall((:EC_POINT_new, LIBCRYPTO), Ptr{Cvoid}, (Ptr{Cvoid},), group)
+        JWTs.require_openssl_nonnull(point, "EC_POINT_new")
+        JWTs.require_openssl_ok(
+            ccall(
+                (:EC_POINT_mul, LIBCRYPTO),
+                Cint,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                group,
+                point,
+                priv,
+                C_NULL,
+                C_NULL,
+                C_NULL,
+            ),
+            "EC_POINT_mul",
+        )
+        JWTs.require_openssl_ok(
+            ccall((:EC_KEY_set_public_key, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), ec_key, point),
+            "EC_KEY_set_public_key",
+        )
+        pkey = ccall((:EVP_PKEY_new, LIBCRYPTO), Ptr{Cvoid}, ())
+        JWTs.require_openssl_nonnull(pkey, "EVP_PKEY_new")
+        JWTs.require_openssl_ok(
+            ccall((:EVP_PKEY_set1_EC_KEY, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), pkey, ec_key),
+            "EVP_PKEY_set1_EC_KEY",
+        )
+        key = JWTs.OpenSSLKey(pkey)
+        pkey = C_NULL
+        return key
+    catch
+        return nothing
+    finally
+        JWTs.free_evp_pkey!(pkey)
+        JWTs.free_ec_point!(point)
+        JWTs.free_ec_key!(ec_key)
+        JWTs.free_bn!(priv)
+    end
+end
+
+function ed25519_key_from_seed(seed::Vector{UInt8})
     length(seed) == ED25519_SEED_BYTES || error("Ed25519 seeds must be $(ED25519_SEED_BYTES) bytes")
-    public = Vector{UInt8}(undef, ED25519_PUBLIC_KEY_BYTES)
-    secret = Vector{UInt8}(undef, ED25519_SECRET_KEY_BYTES)
-    GC.@preserve seed public secret begin
-        result = ccall(
-            (:crypto_sign_ed25519_seed_keypair, LIBSODIUM),
-            Cint,
-            (Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
-            pointer(public),
-            pointer(secret),
-            pointer(seed),
-        )
-        result == 0 || error("Unable to derive Ed25519 keypair from seed")
-    end
-    return secret, public
+    pkey = GC.@preserve seed ccall(
+        (:EVP_PKEY_new_raw_private_key, LIBCRYPTO),
+        Ptr{Cvoid},
+        (Cint, Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
+        JWTs.ed25519_pkey_id(),
+        C_NULL,
+        pointer(seed),
+        Csize_t(length(seed)),
+    )
+    return JWTs.OpenSSLKey(pkey)
 end
 
-function ed25519_public_from_secret(secret::Vector{UInt8})
-    ensure_sodium_initialized()
-    length(secret) == ED25519_SECRET_KEY_BYTES || error("Ed25519 secret keys must be $(ED25519_SECRET_KEY_BYTES) bytes")
+function ed25519_public_from_key(key::JWTs.OpenSSLKey)
     public = Vector{UInt8}(undef, ED25519_PUBLIC_KEY_BYTES)
-    GC.@preserve secret public begin
-        result = ccall(
-            (:crypto_sign_ed25519_sk_to_pk, LIBSODIUM),
-            Cint,
-            (Ptr{UInt8}, Ptr{UInt8}),
-            pointer(public),
-            pointer(secret),
-        )
-        result == 0 || error("Unable to derive Ed25519 public key from secret key")
-    end
+    len = Ref{Csize_t}(length(public))
+    ret = GC.@preserve key public ccall(
+        (:EVP_PKEY_get_raw_public_key, LIBCRYPTO),
+        Cint,
+        (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}),
+        key.ptr,
+        pointer(public),
+        len,
+    )
+    JWTs.require_openssl_ok(ret, "EVP_PKEY_get_raw_public_key")
+    len[] == ED25519_PUBLIC_KEY_BYTES || error("Unexpected Ed25519 public key length")
     return public
+end
+
+"""
+    ed25519_seed_keypair(seed) -> (secret::Vector{UInt8}, public::Vector{UInt8})
+
+Derives an Ed25519 keypair from a 32-byte seed. The secret is returned in the
+conventional 64-byte form (seed followed by the public key).
+"""
+function ed25519_seed_keypair(seed::Vector{UInt8})
+    public = ed25519_public_from_key(ed25519_key_from_seed(seed))
+    return vcat(seed, public), public
+end
+
+"""
+    eddsa_signer_from_bytes(data) -> EdDSASigner
+
+Accepts either a 64-byte Ed25519 private key or a 32-byte seed and returns
+an `EdDSASigner`.
+"""
+function eddsa_signer_from_bytes(raw)
+    bytes = normalize_key_bytes(raw)
+    seed = if length(bytes) == ED25519_SECRET_KEY_BYTES
+        # libsodium-format secret key: seed followed by the public key
+        bytes[1:ED25519_SEED_BYTES]
+    elseif length(bytes) == ED25519_SEED_BYTES
+        bytes
+    else
+        error("Unsupported Ed25519 key length ($(length(bytes)))")
+    end
+    key = ed25519_key_from_seed(seed)
+    return EdDSASigner(key, ed25519_public_from_key(key))
 end
 
 """
@@ -203,243 +327,46 @@ signer = eddsa_signer_from_bytes(secret)
 ```
 """
 function generate_ed25519_keypair(; rng=Random.RandomDevice())
-    ensure_sodium_initialized()
-    seed = rand(rng, UInt8, ED25519_SEED_BYTES)
-    return ed25519_seed_keypair(seed)
+    return ed25519_seed_keypair(rand(rng, UInt8, ED25519_SEED_BYTES))
 end
 
-"""
-    rsa_signer_from_bytes(data) -> RSASigner
+# ── signing and verifying ───────────────────────────────────────────────────
 
-Accepts DER or PEM-encoded PKCS#8/PKCS#1 private keys and returns an
-`RSASigner`.  The helper tries PKCS#8 first, then PKCS#1, and throws a
-helpful error if parsing fails.
-"""
-function rsa_signer_from_bytes(raw)
-    bytes = normalize_key_bytes(raw)
-    alloc = default_aws_allocator()
-    key_ptr = Ptr{aws_rsa_key_pair}(C_NULL)
-    GC.@preserve bytes begin
-        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(bytes)), length(bytes))
-        key_ptr = aws_rsa_key_pair_new_from_private_key_pkcs8(alloc, cursor)
-        if key_ptr == C_NULL
-            key_ptr = aws_rsa_key_pair_new_from_private_key_pkcs1(alloc, cursor)
-        end
-    end
-    key_ptr == C_NULL && error("Failed to load RSA private key (expected PKCS#8 or PKCS#1 DER/PEM)")
-    return RSASigner(RSAKeyHandle(key_ptr))
-end
-
-"""
-    ecc_signer_from_bytes(data, curve::Symbol) -> ECSigner
-
-Loads an EC private key for the provided curve (`:P256` or `:P384`) and
-returns an `ECSigner` ready for JWT signing.
-"""
-function ecc_signer_from_bytes(raw, curve::Symbol)
-    bytes = normalize_key_bytes(raw)
-    alloc = default_aws_allocator()
-    curve_id = curve == :P256 ? AWS_CAL_ECDSA_P256 :
-               curve == :P384 ? AWS_CAL_ECDSA_P384 :
-               error("Unsupported EC curve: $curve")
-    key_ptr = Ptr{aws_ecc_key_pair}(C_NULL)
-    GC.@preserve bytes begin
-        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(bytes)), length(bytes))
-        cursor_ref = Ref(cursor)
-        key_ptr = aws_ecc_key_pair_new_from_asn1(alloc, cursor_ref)
-        if key_ptr == C_NULL
-            key_ptr = aws_ecc_key_pair_new_from_private_key(alloc, curve_id, cursor_ref)
-        end
-    end
-    key_ptr == C_NULL && error("Failed to load EC private key for curve $(curve)")
-    return ECSigner(ECCKeyHandle(key_ptr), curve)
-end
-
-"""
-    eddsa_signer_from_bytes(data) -> EdDSASigner
-
-Accepts either a 64-byte Ed25519 private key or a 32-byte seed and returns
-an `EdDSASigner`.
-"""
-function eddsa_signer_from_bytes(raw)
-    bytes = normalize_key_bytes(raw)
-    if length(bytes) == ED25519_SECRET_KEY_BYTES
-        secret = bytes
-        public = ed25519_public_from_secret(secret)
-        return EdDSASigner(secret, public)
-    elseif length(bytes) == ED25519_SEED_BYTES
-        secret, public = ed25519_seed_keypair(bytes)
-        return EdDSASigner(secret, public)
-    else
-        error("Unsupported Ed25519 key length ($(length(bytes)))")
-    end
-end
-
-function allocate_byte_buf(capacity::Integer)
-    buf = Ref(AwsCommon.aws_byte_buf(0, Ptr{UInt8}(C_NULL), 0, Ptr{AwsCommon.aws_allocator}(C_NULL)))
-    res = AwsCommon.aws_byte_buf_init(buf, default_aws_allocator(), capacity)
-    res == 0 || error("aws_byte_buf_init failed with code $res")
-    return buf
-end
-
-function take_byte_buf(buf::Ref{AwsCommon.aws_byte_buf})
-    len = buf[].len
-    ptr = buf[].buffer
-    data = unsafe_wrap(Vector{UInt8}, ptr, len; own=false)
-    copy_data = Vector{UInt8}(data)
-    AwsCommon.aws_byte_buf_clean_up(buf)
-    return copy_data
-end
+# JWTs' EVP helpers take the JWS signing input as a String.
+signing_input_string(signing_input::Vector{UInt8}) = String(copy(signing_input))
 
 function sign_jws(signer::RSASigner, alg::Symbol, signing_input::Vector{UInt8})
     alg in SUPPORTED_RSA_ALGS || error("Unsupported RSA JWT alg $(alg)")
-    digest = rsa_digest(alg, signing_input)
-    algorithm = rsa_signature_algorithm(alg)
-    sig_buf = allocate_byte_buf(Int(aws_rsa_key_pair_signature_length(signer.key.ptr)))
-    GC.@preserve digest begin
-        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
-        result = aws_rsa_key_pair_sign_message(
-            signer.key.ptr,
-            algorithm,
-            cursor,
-            sig_buf,
-        )
-        result == 0 || begin
-            AwsCommon.aws_byte_buf_clean_up(sig_buf)
-            error("RSA signing failed with code $(result)")
-        end
-    end
-    return take_byte_buf(sig_buf)
+    return JWTs.evp_digest_sign(signer.key, jose_alg_name(alg), signing_input_string(signing_input))
 end
 
 function sign_jws(signer::ECSigner, alg::Symbol, signing_input::Vector{UInt8})
     alg in SUPPORTED_EC_ALGS || error("Unsupported EC JWT alg $(alg)")
-    digest = algorithm_digest(alg, signing_input)
-    sig_capacity = Int(aws_ecc_key_pair_signature_length(signer.key.ptr))
-    sig_buf = allocate_byte_buf(sig_capacity)
-    GC.@preserve digest begin
-        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
-        cursor_ref = Ref(cursor)
-        result = aws_ecc_key_pair_sign_message(
-            signer.key.ptr,
-            cursor_ref,
-            sig_buf,
-        )
-        result == 0 || begin
-            AwsCommon.aws_byte_buf_clean_up(sig_buf)
-            error("EC signing failed with code $(result)")
-        end
-    end
-    der_signature = take_byte_buf(sig_buf)
-    size = signer.curve == :P256 ? 32 : 48
-    return der_to_jws_signature(der_signature, size)
+    return JWTs.sign_ec(signer.key, jose_alg_name(alg), signing_input_string(signing_input))
 end
 
 function sign_jws(signer::EdDSASigner, alg::Symbol, signing_input::Vector{UInt8})
     alg in SUPPORTED_OKP_ALGS || error("Unsupported OKP alg $(alg)")
-    ensure_sodium_initialized()
-    signature = Vector{UInt8}(undef, ED25519_SIGNATURE_BYTES)
-    sig_len = Ref{Csize_t}(0)
-    secret = signer.secret
-    GC.@preserve signature signing_input secret begin
-        result = ccall(
-            (:crypto_sign_ed25519_detached, LIBSODIUM),
-            Cint,
-            (Ptr{UInt8}, Ptr{Csize_t}, Ptr{UInt8}, Culonglong, Ptr{UInt8}),
-            pointer(signature),
-            sig_len,
-            pointer(signing_input),
-            Culonglong(length(signing_input)),
-            pointer(secret),
-        )
-        result == 0 || error("Ed25519 signing failed (code $(result))")
-    end
-    sig_len[] == ED25519_SIGNATURE_BYTES || error("Incorrect Ed25519 signature length")
-    return signature
+    return JWTs.sign_okp(signer.key, jose_alg_name(alg), signing_input_string(signing_input))
 end
 
 function verify_jws(verifier::RSAVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
     alg in SUPPORTED_RSA_ALGS || error("Unsupported RSA JWT alg $(alg)")
-    digest = rsa_digest(alg, signing_input)
-    algorithm = rsa_signature_algorithm(alg)
-    GC.@preserve digest signature begin
-        digest_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
-        sig_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(signature)), length(signature))
-        result = aws_rsa_key_pair_verify_signature(
-            verifier.key.ptr,
-            algorithm,
-            digest_cursor,
-            sig_cursor,
-        )
-        return result == 0
-    end
+    return JWTs.evp_digest_verify(verifier.key, jose_alg_name(alg), signing_input_string(signing_input), signature)
 end
 
 function verify_jws(verifier::ECVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
     alg in SUPPORTED_EC_ALGS || error("Unsupported EC JWT alg $(alg)")
-    digest = algorithm_digest(alg, signing_input)
-    coord = verifier.curve == :P256 ? 32 : 48
-    der_signature = jws_to_der_signature(signature, coord)
-    GC.@preserve digest der_signature begin
-        digest_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(digest)), length(digest))
-        der_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(der_signature)), length(der_signature))
-        cursor_ref = Ref(digest_cursor)
-        sig_ref = Ref(der_cursor)
-        result = aws_ecc_key_pair_verify_signature(
-            verifier.key.ptr,
-            cursor_ref,
-            sig_ref,
-        )
-        return result == 0
-    end
+    return JWTs.verify_ec(verifier.key, jose_alg_name(alg), signing_input_string(signing_input), signature)
 end
 
 function verify_jws(verifier::EdDSAVerifier, alg::Symbol, signing_input::Vector{UInt8}, signature::Vector{UInt8})
     alg in SUPPORTED_OKP_ALGS || error("Unsupported OKP alg $(alg)")
     length(signature) == ED25519_SIGNATURE_BYTES || return false
-    ensure_sodium_initialized()
-    public = verifier.public
-    GC.@preserve signature signing_input public begin
-        result = ccall(
-            (:crypto_sign_ed25519_verify_detached, LIBSODIUM),
-            Cint,
-            (Ptr{UInt8}, Ptr{UInt8}, Culonglong, Ptr{UInt8}),
-            pointer(signature),
-            pointer(signing_input),
-            Culonglong(length(signing_input)),
-            pointer(public),
-        )
-        return result == 0
-    end
+    return JWTs.verify_okp(verifier.key, jose_alg_name(alg), signing_input_string(signing_input), signature)
 end
 
-
-function algorithm_digest(alg::Symbol, input::Vector{UInt8})
-    if alg in (:ES256, :RS256)
-        return SHA.sha256(input)
-    elseif alg == :ES384
-        return SHA.sha384(input)
-    else
-        error("Unsupported digest for alg $(alg)")
-    end
-end
-
-function der_to_jws_signature(der::Vector{UInt8}, coordinate_size::Int)
-    length(der) >= 8 || error("Invalid DER signature (too short)")
-    idx = 1
-    der[idx] == 0x30 || error("Invalid DER signature (expected sequence)")
-    idx += 1
-    total_len, consumed = read_der_length(der, idx)
-    idx += consumed
-    end_idx = idx + total_len - 1
-    r, idx = parse_der_integer(der, idx)
-    s, idx = parse_der_integer(der, idx)
-    idx - 1 == end_idx || error("Invalid DER signature length")
-    (length(r) <= coordinate_size && length(s) <= coordinate_size) || error("Invalid DER signature integer length")
-    r_bytes = lpad_bytes(r, coordinate_size)
-    s_bytes = lpad_bytes(s, coordinate_size)
-    return vcat(r_bytes, s_bytes)
-end
+# ── DER helpers (pure Julia) ────────────────────────────────────────────────
 
 function read_der_length(der::Vector{UInt8}, idx::Int)
     length_byte = der[idx]
@@ -465,76 +392,6 @@ function parse_der_integer(der::Vector{UInt8}, idx::Int)
         value = value[2:end]
     end
     return value, idx
-end
-
-function lpad_bytes(bytes::Vector{UInt8}, size::Int)
-    length(bytes) <= size || error("Cannot left pad bytes larger than size")
-    if length(bytes) == size
-        return bytes
-    end
-    padded = Vector{UInt8}(undef, size)
-    fill!(padded, 0x00)
-    copyto!(padded, size - length(bytes) + 1, bytes, 1, length(bytes))
-    return padded
-end
-
-function strip_leading_zeros(bytes::Vector{UInt8})
-    idx = findfirst(b -> b != 0x00, bytes)
-    if idx === nothing
-        return UInt8[0x00]
-    elseif idx == 1
-        return copy(bytes)
-    else
-        return bytes[idx:end]
-    end
-end
-
-function encode_der_length(len::Integer)
-    len < 0 && error("DER length cannot be negative")
-    if len < 0x80
-        return UInt8[len]
-    end
-    buf = UInt8[]
-    value = len
-    while value > 0
-        pushfirst!(buf, value & 0xff)
-        value >>= 8
-    end
-    pushfirst!(buf, 0x80 | length(buf))
-    return buf
-end
-
-function encode_der_integer(bytes::Vector{UInt8})
-    stripped = strip_leading_zeros(bytes)
-    if stripped[1] & 0x80 != 0
-        stripped = vcat(UInt8[0x00], stripped)
-    end
-    len_bytes = encode_der_length(length(stripped))
-    return vcat(UInt8[0x02], len_bytes, stripped)
-end
-
-function encode_der_sequence(parts::Vector{Vector{UInt8}})
-    total_len = sum(length, parts)
-    len_bytes = encode_der_length(total_len)
-    buffer = Vector{UInt8}(undef, 1 + length(len_bytes) + total_len)
-    buffer[1] = 0x30
-    copyto!(buffer, 2, len_bytes, 1, length(len_bytes))
-    offset = 1 + length(len_bytes)
-    for part in parts
-        copyto!(buffer, offset + 1, part, 1, length(part))
-        offset += length(part)
-    end
-    return buffer
-end
-
-function jws_to_der_signature(signature::Vector{UInt8}, coordinate_size::Int)
-    expected = coordinate_size * 2
-    length(signature) == expected || error("Invalid JWS signature length for curve size $(coordinate_size)")
-    r = signature[1:coordinate_size]
-    s = signature[coordinate_size+1:end]
-    r_der = encode_der_integer(r)
-    s_der = encode_der_integer(s)
-    return encode_der_sequence([r_der, s_der])
 end
 
 function base64urlencode(data)
@@ -694,10 +551,9 @@ Normalizes any vector-like input to a 32-byte Ed25519 public key and
 returns an `EdDSAVerifier`.
 """
 function eddsa_verifier_from_bytes(raw)
-    ensure_sodium_initialized()
     bytes = Vector{UInt8}(raw)
     length(bytes) == ED25519_PUBLIC_KEY_BYTES || error("Ed25519 public keys must be $(ED25519_PUBLIC_KEY_BYTES) bytes")
-    return EdDSAVerifier(bytes)
+    return EdDSAVerifier(JWTs.okp_public_key("Ed25519", bytes), bytes)
 end
 
 """
@@ -707,25 +563,24 @@ Creates an RSA verification handle from DER-encoded PKCS#1 public key
 bytes.
 """
 function rsa_verifier_from_der(der::Vector{UInt8})
-    alloc = default_aws_allocator()
-    key_ptr = Ptr{aws_rsa_key_pair}(C_NULL)
-    GC.@preserve der begin
-        cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(der)), length(der))
-        key_ptr = aws_rsa_key_pair_new_from_public_key_pkcs1(alloc, cursor)
-    end
-    key_ptr == C_NULL && error("Failed to load RSA public key from DER bytes")
-    return RSAVerifier(RSAKeyHandle(key_ptr))
+    idx = 1
+    der[idx] == 0x30 || error("Failed to load RSA public key from DER bytes")
+    idx += 1
+    _, consumed = read_der_length(der, idx)
+    idx += consumed
+    modulus, idx = parse_der_integer(der, idx)
+    exponent, _ = parse_der_integer(der, idx)
+    return RSAVerifier(JWTs.rsa_public_key(modulus, exponent))
 end
 
 """
     rsa_verifier_from_components(modulus, exponent) -> RSAVerifier
 
-Convenience helper that builds the DER structure for you when you already
-have big-endian modulus/exponent values.
+Convenience helper that builds the verification handle directly from
+big-endian modulus/exponent values.
 """
 function rsa_verifier_from_components(modulus::Vector{UInt8}, exponent::Vector{UInt8})
-    der = encode_der_sequence([encode_der_integer(modulus), encode_der_integer(exponent)])
-    return rsa_verifier_from_der(der)
+    return RSAVerifier(JWTs.rsa_public_key(modulus, exponent))
 end
 
 """
@@ -735,19 +590,39 @@ Extracts the affine coordinates for the signer’s public key so you can
 publish a JWK or construct a verifier.
 """
 function ecc_public_coordinates(signer::ECSigner)
-    x_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
-    y_ref = Ref(AwsCommon.aws_byte_cursor(Csize_t(0), Ptr{UInt8}(C_NULL)))
-    # aws_ecc_key_pair_get_public_key returns void, so the coordinates themselves are
-    # the only success signal available.
-    aws_ecc_key_pair_get_public_key(signer.key.ptr, x_ref, y_ref)
     expected = signer.curve == :P256 ? 32 : 48
-    (x_ref[].ptr == C_NULL || y_ref[].ptr == C_NULL) &&
-        error("EC key pair does not expose public key coordinates; provide an explicit public_jwk")
-    (x_ref[].len == expected && y_ref[].len == expected) ||
-        error("Unexpected EC public key coordinate length for curve $(signer.curve): got $(x_ref[].len)/$(y_ref[].len), expected $(expected)")
-    x_bytes = unsafe_wrap(Vector{UInt8}, x_ref[].ptr, x_ref[].len; own=false)
-    y_bytes = unsafe_wrap(Vector{UInt8}, y_ref[].ptr, y_ref[].len; own=false)
-    return copy(x_bytes), copy(y_bytes)
+    # OSSL_PKEY_PARAM_PUB_KEY yields the encoded public point; for a named
+    # curve this is the uncompressed form 0x04 || x || y.
+    needed = Ref{Csize_t}(0)
+    key = signer.key
+    ret = GC.@preserve key ccall(
+        (:EVP_PKEY_get_octet_string_param, LIBCRYPTO),
+        Cint,
+        (Ptr{Cvoid}, Cstring, Ptr{UInt8}, Csize_t, Ref{Csize_t}),
+        key.ptr,
+        "pub",
+        Ptr{UInt8}(C_NULL),
+        Csize_t(0),
+        needed,
+    )
+    ret == 1 || error("EC key pair does not expose public key coordinates; provide an explicit public_jwk")
+    point = Vector{UInt8}(undef, Int(needed[]))
+    ret = GC.@preserve key point ccall(
+        (:EVP_PKEY_get_octet_string_param, LIBCRYPTO),
+        Cint,
+        (Ptr{Cvoid}, Cstring, Ptr{UInt8}, Csize_t, Ref{Csize_t}),
+        key.ptr,
+        "pub",
+        pointer(point),
+        Csize_t(length(point)),
+        needed,
+    )
+    ret == 1 || error("EC key pair does not expose public key coordinates; provide an explicit public_jwk")
+    (length(point) == 1 + 2 * expected && point[1] == 0x04) ||
+        error("Unexpected EC public key coordinate length for curve $(signer.curve): got $(length(point)) encoded bytes, expected $(1 + 2 * expected)")
+    x = point[2:1 + expected]
+    y = point[2 + expected:end]
+    return x, y
 end
 
 """
@@ -756,18 +631,7 @@ end
 Builds an `ECVerifier` from the raw affine coordinates of a public key.
 """
 function ecc_verifier_from_coordinates(x::Vector{UInt8}, y::Vector{UInt8}, curve::Symbol)
-    alloc = default_aws_allocator()
-    curve_id = curve == :P256 ? AWS_CAL_ECDSA_P256 :
-               curve == :P384 ? AWS_CAL_ECDSA_P384 :
-               error("Unsupported EC curve $(curve)")
-    key_ptr = Ptr{aws_ecc_key_pair}(C_NULL)
-    GC.@preserve x y begin
-        x_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(x)), length(x))
-        y_cursor = AwsCommon.aws_byte_cursor_from_array(Ptr{Cvoid}(pointer(y)), length(y))
-        key_ptr = aws_ecc_key_pair_new_from_public_key(alloc, curve_id, Ref(x_cursor), Ref(y_cursor))
-    end
-    key_ptr == C_NULL && error("Failed to load EC public key")
-    return ECVerifier(ECCKeyHandle(key_ptr), curve)
+    return ECVerifier(JWTs.ec_public_key(jose_curve_name(curve), x, y), curve)
 end
 
 function parse_rsa_pkcs1_private_key(bytes::Vector{UInt8})
