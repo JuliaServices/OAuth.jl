@@ -1,7 +1,7 @@
 module OAuth
 
 using AbstractStores
-using Dates, HTTP, JSON, Random, SHA, Base64, LibAwsCal, LibAwsCommon, FileWatching
+using Dates, HTTP, JSON, JWTs, Random, SHA, Base64, OpenSSL_jll, FileWatching
 
 const DEFAULT_RESPONSE_TYPE = "code"
 const MAX_DPOP_NONCE_RETRIES = 1
