@@ -281,6 +281,59 @@ function base64url(bytes::AbstractVector{UInt8})
     return String(out)
 end
 
+const BASE64STD_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const BASE64STD_ENCODE_TABLE = Vector{UInt8}(codeunits(BASE64STD_CHARS))
+
+"""
+    base64standard(data) -> String
+
+Standard base64-encode `data` with `=` padding, per RFC 4648 Section 4 (the form
+HTTP Basic credentials and the token cache files use). Implemented directly for
+the same reason as [`base64url`](@ref): the Base64 stdlib's IO-pipe
+implementation is not resolvable under `juliac --trim=safe`. Decoding needs no
+standard-alphabet twin — [`base64urldecode`](@ref) accepts both alphabets and
+padding.
+"""
+function base64standard(bytes::AbstractVector{UInt8})
+    n = length(bytes)
+    n == 0 && return ""
+    out = Vector{UInt8}(undef, 4 * cld(n, 3))
+    table = BASE64STD_ENCODE_TABLE
+    j = 0
+    i = firstindex(bytes)
+    last = lastindex(bytes)
+    @inbounds while i + 2 <= last
+        b1 = bytes[i]
+        b2 = bytes[i + 1]
+        b3 = bytes[i + 2]
+        out[j + 1] = table[Int(b1 >> 2) + 1]
+        out[j + 2] = table[Int(((b1 & 0x03) << 4) | (b2 >> 4)) + 1]
+        out[j + 3] = table[Int(((b2 & 0x0f) << 2) | (b3 >> 6)) + 1]
+        out[j + 4] = table[Int(b3 & 0x3f) + 1]
+        j += 4
+        i += 3
+    end
+    @inbounds if i + 1 <= last
+        b1 = bytes[i]
+        b2 = bytes[i + 1]
+        out[j + 1] = table[Int(b1 >> 2) + 1]
+        out[j + 2] = table[Int(((b1 & 0x03) << 4) | (b2 >> 4)) + 1]
+        out[j + 3] = table[Int((b2 & 0x0f) << 2) + 1]
+        out[j + 4] = UInt8('=')
+        j += 4
+    elseif i <= last
+        b1 = bytes[i]
+        out[j + 1] = table[Int(b1 >> 2) + 1]
+        out[j + 2] = table[Int((b1 & 0x03) << 4) + 1]
+        out[j + 3] = UInt8('=')
+        out[j + 4] = UInt8('=')
+        j += 4
+    end
+    resize!(out, j)
+    return String(out)
+end
+base64standard(data::AbstractString) = base64standard(codeunits(String(data)))
+
 """
     base64urldecode(str) -> Vector{UInt8}
 
