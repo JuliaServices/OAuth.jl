@@ -106,7 +106,7 @@ function decode_pem(data::AbstractString)
     end
     encoded = String(take!(io))
     close(io)
-    return Base64.base64decode(encoded)
+    return base64urldecode(encoded)
 end
 
 normalize_key_bytes(data::AbstractString) = decode_pem(data)
@@ -695,16 +695,23 @@ issuer = JWTAccessTokenIssuer(
 )
 ```
 
-# Note
-This function requires OpenSSL to be installed and available in your PATH.
 """
 function generate_rsa_private_key(; bits::Integer=2048)
     bits > 0 || error("RSA key size must be positive")
-    cmd = `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:$bits`
+    ctx = ccall((:EVP_PKEY_CTX_new_id, LIBCRYPTO), Ptr{Cvoid}, (Cint, Ptr{Cvoid}), NID_RSA_ENCRYPTION, C_NULL)
+    JWTs.require_openssl_nonnull(ctx, "EVP_PKEY_CTX_new_id(RSA)")
     try
-        return read(cmd, String)
-    catch e
-        error("Failed to generate RSA key: $(e)")
+        JWTs.require_openssl_ok(
+            ccall((:EVP_PKEY_keygen_init, LIBCRYPTO), Cint, (Ptr{Cvoid},), ctx),
+            "EVP_PKEY_keygen_init",
+        )
+        JWTs.require_openssl_ok(
+            ccall((:EVP_PKEY_CTX_set_rsa_keygen_bits, LIBCRYPTO), Cint, (Ptr{Cvoid}, Cint), ctx, Cint(bits)),
+            "EVP_PKEY_CTX_set_rsa_keygen_bits",
+        )
+        return keygen_pem(ctx)
+    finally
+        ccall((:EVP_PKEY_CTX_free, LIBCRYPTO), Cvoid, (Ptr{Cvoid},), ctx)
     end
 end
 
@@ -729,16 +736,55 @@ issuer = JWTAccessTokenIssuer(
 )
 ```
 
-# Note
-This function requires OpenSSL to be installed and available in your PATH.
 """
 function generate_ec_private_key(; curve::Symbol=:P256)
-    curve in (:P256, :P384) || error("Unsupported EC curve: $curve (supported: :P256, :P384)")
-    curve_name = curve == :P256 ? "prime256v1" : "secp384r1"
-    cmd = `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:$curve_name`
+    crv = jose_curve_name(curve)
+    ctx = ccall((:EVP_PKEY_CTX_new_id, LIBCRYPTO), Ptr{Cvoid}, (Cint, Ptr{Cvoid}), NID_X9_62_EC, C_NULL)
+    JWTs.require_openssl_nonnull(ctx, "EVP_PKEY_CTX_new_id(EC)")
     try
-        return read(cmd, String)
-    catch e
-        error("Failed to generate EC key: $(e)")
+        JWTs.require_openssl_ok(
+            ccall((:EVP_PKEY_keygen_init, LIBCRYPTO), Cint, (Ptr{Cvoid},), ctx),
+            "EVP_PKEY_keygen_init",
+        )
+        JWTs.require_openssl_ok(
+            ccall((:EVP_PKEY_CTX_set_ec_paramgen_curve_nid, LIBCRYPTO), Cint, (Ptr{Cvoid}, Cint), ctx, JWTs.ec_group_nid(crv)),
+            "EVP_PKEY_CTX_set_ec_paramgen_curve_nid",
+        )
+        return keygen_pem(ctx)
+    finally
+        ccall((:EVP_PKEY_CTX_free, LIBCRYPTO), Cvoid, (Ptr{Cvoid},), ctx)
+    end
+end
+
+# Finish a configured keygen context and PEM-encode the key (unencrypted
+# PKCS#8, the same form `openssl genpkey` emits).
+function keygen_pem(ctx::Ptr{Cvoid})
+    pkey_ref = Ref{Ptr{Cvoid}}(C_NULL)
+    JWTs.require_openssl_ok(
+        ccall((:EVP_PKEY_keygen, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ref{Ptr{Cvoid}}), ctx, pkey_ref),
+        "EVP_PKEY_keygen",
+    )
+    pkey = pkey_ref[]
+    bio = Ptr{Cvoid}(C_NULL)
+    try
+        method = ccall((:BIO_s_mem, LIBCRYPTO), Ptr{Cvoid}, ())
+        bio = ccall((:BIO_new, LIBCRYPTO), Ptr{Cvoid}, (Ptr{Cvoid},), method)
+        JWTs.require_openssl_nonnull(bio, "BIO_new")
+        JWTs.require_openssl_ok(
+            ccall(
+                (:PEM_write_bio_PKCS8PrivateKey, LIBCRYPTO),
+                Cint,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Cvoid}, Ptr{Cvoid}),
+                bio, pkey, C_NULL, C_NULL, Cint(0), C_NULL, C_NULL,
+            ),
+            "PEM_write_bio_PKCS8PrivateKey",
+        )
+        data_ref = Ref{Ptr{UInt8}}(C_NULL)
+        len = ccall((:BIO_ctrl, LIBCRYPTO), Clong, (Ptr{Cvoid}, Cint, Clong, Ref{Ptr{UInt8}}), bio, 3, 0, data_ref) # BIO_CTRL_INFO
+        (len > 0 && data_ref[] != C_NULL) || throw(JWTs.openssl_error("BIO_ctrl(BIO_CTRL_INFO)"))
+        return unsafe_string(data_ref[], len)
+    finally
+        JWTs.free_bio!(bio)
+        JWTs.free_evp_pkey!(pkey)
     end
 end
