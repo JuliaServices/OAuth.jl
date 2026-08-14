@@ -72,7 +72,7 @@ function refresh_token_file_contents(token::String)
     payload = Dict(
         "version" => TOKEN_FILE_VERSION,
         "encoding" => TOKEN_FILE_ENCODING,
-        "refresh_token" => Base64.base64encode(token),
+        "refresh_token" => base64standard(token),
     )
     return JSON.json(payload) * "\n"
 end
@@ -103,7 +103,7 @@ function decode_token_field(value, encoding::String)
     value isa AbstractString || return nothing
     if encoding == TOKEN_FILE_ENCODING
         decoded = try
-            Base64.base64decode(String(value))
+            base64urldecode(String(value))
         catch
             nothing
         end
@@ -941,8 +941,8 @@ function token_file_contents(token::TokenResponse)
     payload = Dict(
         "version" => TOKEN_FILE_VERSION,
         "encoding" => TOKEN_FILE_ENCODING,
-        "access_token" => Base64.base64encode(token.access_token),
-        "refresh_token" => token.refresh_token === nothing ? nothing : Base64.base64encode(token.refresh_token),
+        "access_token" => base64standard(token.access_token),
+        "refresh_token" => token.refresh_token === nothing ? nothing : base64standard(token.refresh_token),
         "expires_at" => token.expires_at === nothing ? nothing : string(token.expires_at),
         "token_type" => token.token_type,
         "scope" => token.scope,

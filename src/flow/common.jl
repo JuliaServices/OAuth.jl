@@ -246,7 +246,7 @@ function apply_token_endpoint_auth!(
             set!(form, "client_secret", credential.secret)
         elseif credential.method == :client_secret_basic
             credentials = string(form_escape(client_id), ":", form_escape(credential.secret))
-            encoded = Base64.base64encode(credentials)
+            encoded = base64standard(credentials)
             push!(headers, "Authorization" => "Basic $(encoded)")
         else
             throw(OAuthError(:configuration_error, "Unsupported client secret auth method $(credential.method)"))

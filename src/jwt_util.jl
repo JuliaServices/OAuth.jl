@@ -106,7 +106,7 @@ function decode_pem(data::AbstractString)
     end
     encoded = String(take!(io))
     close(io)
-    return Base64.base64decode(encoded)
+    return base64urldecode(encoded)
 end
 
 normalize_key_bytes(data::AbstractString) = decode_pem(data)

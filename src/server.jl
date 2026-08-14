@@ -1651,7 +1651,7 @@ function client_credentials_authenticator(credentials; allow_public::Bool=false)
         if credentials !== nothing && ascii_lc_isequal(credentials.scheme, "basic")
             encoded = credentials.token
             decoded = try
-                String(Base64.base64decode(encoded))
+                String(base64urldecode(encoded))
             catch err
                 throw(OAuthError(:invalid_client, "Invalid Authorization header: $(err)"))
             end
@@ -2228,7 +2228,7 @@ function authenticate_request(auth::BasicCredentialsAuthenticator, req::HTTP.Req
     end
     encoded = credentials.token
     decoded = try
-        String(Base64.base64decode(encoded))
+        String(base64urldecode(encoded))
     catch
         return false
     end
