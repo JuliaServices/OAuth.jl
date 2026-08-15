@@ -476,16 +476,34 @@ The claims type `C` of the `AccessTokenRecord{C}` values a token store holds.
 `Dict{String,Any}` by default; a custom claims struct when the store was built
 with `AuthorizationServerStores(backend; claims=MyClaims)` or typed directly as
 `AbstractStore{AccessTokenRecord{MyClaims}}`.
+
+A custom claims type must be a concrete struct whose field names match the JWT
+claim names it retains. Stored values must satisfy the declared field types.
+Unknown claims are dropped, and an absent claim supplies `nothing`, so optional
+fields should include `Nothing`. This exact shape keeps construction statically
+dispatchable under `juliac --trim`.
 """
 claimstype(::AbstractStore{AccessTokenRecord{C}}) where {C} = C
 claimstype(::AbstractStore{AccessTokenRecord}) = Dict{String,Any}
 
 # Convert an issued claim set into the store's claims type. The default keeps
-# the dict as is; a custom struct is built with StructUtils' typed
-# construction, so a JSON-backed store round-trips it through typed reads and
-# writes — the shape a statically compiled (`juliac --trim`) server needs.
+# the dict as is. For a custom struct, first project the heterogeneous dict to
+# statically typed field values, then call the struct's normal positional
+# constructor. This avoids dynamic field dispatch under `juliac --trim`; a
+# JSON-backed store can still round-trip the result through StructUtils' typed
+# reads and writes.
 storedclaims(::Type{Dict{String,Any}}, claims::Dict{String,Any}) = claims
-storedclaims(::Type{C}, claims::Dict{String,Any}) where {C} = StructUtils.make(C, claims)
+@generated function storedclaims(::Type{C}, claims::Dict{String,Any}) where {C}
+    C isa DataType && isconcretetype(C) && isstructtype(C) ||
+        return :(StructUtils.make(C, claims))
+    values = Any[]
+    for i in 1:fieldcount(C)
+        key = String(fieldname(C, i))
+        field_type = fieldtype(C, i)
+        push!(values, :(get(claims, $key, nothing)::$field_type))
+    end
+    return :($C($(values...)))
+end
 
 # Read one claim from a stored claims value: a dict lookup, or a field of a
 # custom claims struct (`nothing` when the struct has no such field).

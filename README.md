@@ -415,6 +415,27 @@ directly to their convenience constructors. The older
 `authorization_server_stores(backend)` helper remains available and returns the
 same three stores as a named tuple.
 
+Access-token claims use `Dict{String,Any}` by default. A trim-compiled service,
+or a service that wants typed JSON persistence, can declare its exact claim
+shape. Field names match JWT claim names. Optional fields include `Nothing`;
+unknown claims are dropped.
+
+```julia
+Base.@kwdef struct AccessClaims
+    iss::Union{Nothing,String} = nothing
+    sub::Union{Nothing,String} = nothing
+    aud::Union{Nothing,String,Vector{String}} = nothing
+    exp::Union{Nothing,Int64} = nothing
+    iat::Union{Nothing,Int64} = nothing
+    jti::Union{Nothing,String} = nothing
+    client_id::Union{Nothing,String} = nothing
+    scope::Union{Nothing,String} = nothing
+    tenant::Union{Nothing,String} = nothing
+end
+
+stores = OAuth.AuthorizationServerStores(MemoryStore(); claims=AccessClaims)
+```
+
 `AuthorizationEndpointConfig` and `TokenEndpointConfig` require an atomic,
 TTL-capable authorization-code store, because RFC 6749 §4.1.2 requires a code to
 be redeemable exactly once. `MemoryStore`, `SQLStore`, and `RedisStore` provide
@@ -429,7 +450,10 @@ With such a codec, give each kind of state its own concretely typed store:
 
 ```julia
 stores = OAuth.AuthorizationServerStores(
-    access_tokens=FileStore{OAuth.AccessTokenRecord}(access_dir; codec=JSONCodec()),
+    access_tokens=FileStore{OAuth.AccessTokenRecord{AccessClaims}}(
+        access_dir;
+        codec=JSONCodec(),
+    ),
     authorization_codes=FileStore{OAuth.AuthorizationCodeRecord}(code_dir; codec=JSONCodec()),
     refresh_grants=FileStore{OAuth.RefreshTokenGrantRecord}(refresh_dir; codec=JSONCodec()),
 )

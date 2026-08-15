@@ -1636,6 +1636,19 @@ end
     @test doc["active"] == true
     @test doc["iss"] == "https://id.example.com"
     @test doc["sub"] == "user-9"
+    # A portable codec must decode the persisted record and nested claims at
+    # their declared types rather than falling back to Dict{String,Any}.
+    mktempdir() do directory
+        json_store = FileStore{AccessTokenRecord{AppClaims}}(
+            directory;
+            codec = JSONCodec(),
+        )
+        store_access_token!(json_store, issued; now = issued.issued_at)
+        json_record = lookup_access_token(json_store, issued.token)
+        @test json_record isa AccessTokenRecord{AppClaims}
+        @test json_record.claims isa AppClaims
+        @test json_record.claims.tenant == "acme"
+    end
     # the default path is unchanged: an untyped store keeps Dict{String,Any}
     default_store = InMemoryTokenStore()
     @test OAuth.claimstype(default_store) === Dict{String,Any}
