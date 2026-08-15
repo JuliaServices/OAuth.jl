@@ -409,10 +409,12 @@ Holds the signing material and metadata required to mint JWT access tokens
 for your resource server.  Combine with [`issue_access_token`](@ref) and
 [`public_jwk`](@ref) to build your own auth server in a few lines.
 """
-mutable struct JWTAccessTokenIssuer
+# Parametric on the signer so token minting dispatches statically (juliac
+# --trim); an abstract signer field would make every sign_jws call dynamic.
+mutable struct JWTAccessTokenIssuer{S<:JWTSigner}
     issuer::String
     audience::Vector{String}
-    signer::JWTSigner
+    signer::S
     alg::Symbol
     kid::Union{String,Nothing}
     expires_in::Int
@@ -440,7 +442,10 @@ function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol
     aud = normalize_string_vector(audience)
     kid_value = maybe_string(kid)
     jwk_dict = public_jwk === nothing ? derive_signing_jwk(private_key, signer, alg_symbol, kid_value) : normalize_metadata_dict(public_jwk)
-    return JWTAccessTokenIssuer(String(issuer), aud, signer, alg_symbol, kid_value, Int(expires_in), jwk_dict)
+    # explicit conversion: a parametric struct's implicit constructor does not
+    # convert field arguments (derive_signing_jwk may return Dict{String,String})
+    jwk_any = jwk_dict === nothing ? nothing : convert(Dict{String,Any}, jwk_dict)
+    return JWTAccessTokenIssuer(String(issuer), aud, signer, alg_symbol, kid_value, Int(expires_in), jwk_any)
 end
 
 """
@@ -1128,10 +1133,11 @@ service rotate within one stored token family so replaying an older generation
 revokes the active family.
 """
 struct TokenService{
+    I<:JWTAccessTokenIssuer,
     A<:AccessTokenStore,
     R<:RefreshTokenGrantStore,
 }
-    issuer::JWTAccessTokenIssuer
+    issuer::I
     access_tokens::A
     refresh_grants::R
     refresh_token_ttl::Union{Dates.Second,Nothing}
@@ -1500,9 +1506,9 @@ store, token issuer, client authenticator, refresh token generator, extra
 claims callback, optional persistent token store, allowed grant types, and an
 optional [`TokenService`](@ref) for family-aware refresh-token rotation.
 """
-struct TokenEndpointConfig{S<:AuthorizationCodeStore,C<:Function,R<:Function,E<:Function}
+struct TokenEndpointConfig{S<:AuthorizationCodeStore,I<:JWTAccessTokenIssuer,C<:Function,R<:Function,E<:Function}
     code_store::S
-    token_issuer::JWTAccessTokenIssuer
+    token_issuer::I
     client_authenticator::C
     refresh_token_generator::R
     extra_token_claims::E
