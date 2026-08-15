@@ -460,7 +460,7 @@ struct AccessTokenRecord
     expires_at::DateTime
     client_id::Union{String,Nothing}
     subject::Union{String,Nothing}
-    claims::Dict{String,TokenClaim}
+    claims::Dict{String,Any}
     revoked::Bool
     confirmation_jkt::Union{String,Nothing}
 end
@@ -718,7 +718,7 @@ function store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken;
         issued.expires_at,
         issued.client_id,
         issued.subject,
-        tokenclaims(issued.claims),
+        Dict{String,Any}(issued.claims),
         false,
         issued.confirmation_jkt,
     )
@@ -2831,10 +2831,9 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
         if record === nothing || record.revoked || Dates.now(UTC) > record.expires_at
             return json_no_store_response(Dict("active" => false))
         end
-        claims = record.claims
         response = Dict{String,Any}(
             "active" => true,
-            "iss" => claimstring(claims, "iss"),
+            "iss" => get(record.claims, "iss", nothing),
             "client_id" => record.client_id,
             "sub" => record.subject,
             "exp" => datetime_to_unix(record.expires_at),
@@ -2842,10 +2841,12 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
             "scope" => join(record.scope, ' '),
             "token_type" => "access_token",
         )
-        for name in ("aud", "nbf", "authorization_details", "auth_time", "azp", "username")
-            node = get(claims, name, nothing)
-            node === nothing || (response[name] = claimvalue(node))
-        end
+        haskey(record.claims, "aud") && (response["aud"] = record.claims["aud"])
+        haskey(record.claims, "nbf") && (response["nbf"] = record.claims["nbf"])
+        haskey(record.claims, "authorization_details") && (response["authorization_details"] = record.claims["authorization_details"])
+        haskey(record.claims, "auth_time") && (response["auth_time"] = record.claims["auth_time"])
+        haskey(record.claims, "azp") && (response["azp"] = record.claims["azp"])
+        haskey(record.claims, "username") && (response["username"] = record.claims["username"])
         return json_no_store_response(response)
     end
     return handler

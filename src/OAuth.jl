@@ -9,7 +9,6 @@ const MAX_DPOP_NONCE_RETRIES = 1
 include("errors.jl")
 include("util.jl")
 include("jwt_util.jl")
-include("claims.jl")
 include("types.jl")
 include("wwwauthenticate.jl")
 include("discovery.jl")
@@ -48,8 +47,6 @@ export DEFAULT_LOOPBACK_HOST, DEFAULT_LOOPBACK_PORT, DEFAULT_LOOPBACK_PATH
 export ProtectedResourceConfig, AuthorizationServerConfig, JWTAccessTokenIssuer, IssuedAccessToken
 export AccessTokenClaims, TokenValidationConfig, DPoPReplayCache, DeviceAuthorizationResponse
 export AccessTokenStore, AccessTokenRecord, InMemoryTokenStore
-export TokenClaim, ClaimNull, ClaimBool, ClaimNumber, ClaimString, ClaimArray, ClaimObject
-export tokenclaim, tokenclaims, claimvalue, claimvalues
 export AllowAllAuthenticator, BasicCredentialsAuthenticator
 export register_protected_resource_metadata!, register_authorization_server_metadata!
 export register_jwks_endpoint!, protected_resource_middleware, public_jwk, DEFAULT_JWKS_PATH
