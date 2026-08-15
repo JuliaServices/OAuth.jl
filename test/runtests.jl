@@ -1590,6 +1590,72 @@ end
     @test result2.discovery.authorization_server.issuer == "https://id.example.io"
 end
 
+# A claims struct declared by the application: the store then persists
+# AccessTokenRecord{AppClaims} and reads it back typed — no Dict{String,Any}
+# in the persisted record, which is what a juliac --trim server needs.
+Base.@kwdef struct AppClaims
+    iss::Union{Nothing,String} = nothing
+    sub::Union{Nothing,String} = nothing
+    aud::Union{Nothing,String,Vector{String}} = nothing
+    exp::Union{Nothing,Int64} = nothing
+    iat::Union{Nothing,Int64} = nothing
+    jti::Union{Nothing,String} = nothing
+    client_id::Union{Nothing,String} = nothing
+    scope::Union{Nothing,String} = nothing
+    tenant::Union{Nothing,String} = nothing   # a custom claim the app declares
+end
+
+@testset "custom claims struct in the token store" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://id.example.com",
+        audience = ["https://api.example.com"],
+        private_key = rsa_pem,
+    )
+    backend = AbstractStores.MemoryStore()
+    stores = OAuth.AuthorizationServerStores(backend; claims = AppClaims)
+    @test OAuth.claimstype(stores.access_tokens) === AppClaims
+    issued = issue_access_token(
+        issuer;
+        subject = "user-9",
+        client_id = "client-a",
+        scope = ["read"],
+        extra_claims = Dict{String,Any}("tenant" => "acme", "ignored_by_struct" => 1),
+        store = stores.access_tokens,
+    )
+    record = lookup_access_token(stores.access_tokens, issued.token)
+    @test record isa AccessTokenRecord{AppClaims}
+    @test record.claims.sub == "user-9"
+    @test record.claims.tenant == "acme"
+    @test record.claims.aud == ["https://api.example.com"] || record.claims.aud == "https://api.example.com"
+    @test record.claims.exp isa Int64
+    # introspection reads through the struct's fields
+    handler = build_introspection_handler(stores.access_tokens; authenticator = AllowAllAuthenticator())
+    resp = handler(HTTP.Request("POST", "/introspect", ["Content-Type" => "application/x-www-form-urlencoded"], "token=$(issued.token)"))
+    doc = JSON.parse(String(resp.body))
+    @test doc["active"] == true
+    @test doc["iss"] == "https://id.example.com"
+    @test doc["sub"] == "user-9"
+    # A portable codec must decode the persisted record and nested claims at
+    # their declared types rather than falling back to Dict{String,Any}.
+    mktempdir() do directory
+        json_store = FileStore{AccessTokenRecord{AppClaims}}(
+            directory;
+            codec = JSONCodec(),
+        )
+        store_access_token!(json_store, issued; now = issued.issued_at)
+        json_record = lookup_access_token(json_store, issued.token)
+        @test json_record isa AccessTokenRecord{AppClaims}
+        @test json_record.claims isa AppClaims
+        @test json_record.claims.tenant == "acme"
+    end
+    # the default path is unchanged: an untyped store keeps Dict{String,Any}
+    default_store = InMemoryTokenStore()
+    @test OAuth.claimstype(default_store) === Dict{String,Any}
+    issued2 = issue_access_token(issuer; subject = "user-10", store = default_store)
+    @test lookup_access_token(default_store, issued2.token).claims isa Dict{String,Any}
+end
+
 @testset "Server helpers" begin
     prm_config = ProtectedResourceConfig(
         resource = "https://api.example.com",

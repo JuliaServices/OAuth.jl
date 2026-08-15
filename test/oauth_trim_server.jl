@@ -18,6 +18,18 @@ function _trim_claims()::Dict{String,Any}
     return claims
 end
 
+Base.@kwdef struct TrimClaims
+    iss::Union{Nothing,String} = nothing
+    sub::Union{Nothing,String} = nothing
+    aud::Union{Nothing,String,Vector{String}} = nothing
+    exp::Union{Nothing,Int64} = nothing
+    iat::Union{Nothing,Int64} = nothing
+    jti::Union{Nothing,String} = nothing
+    client_id::Union{Nothing,String} = nothing
+    scope::Union{Nothing,String} = nothing
+    tenant::Union{Nothing,String} = nothing
+end
+
 function _trim_token_store()::Nothing
     now = OAuth.Dates.DateTime(2026, 8, 9, 12, 0, 0)
     issued = OAuth.IssuedAccessToken(
@@ -39,6 +51,48 @@ function _trim_token_store()::Nothing
     _trim_server_assert(OAuth.revoke_access_token!(store, issued.token), "token revocation")
     _trim_server_assert(OAuth.lookup_access_token(store, issued.token) === nothing,
                         "revoked token lookup")
+    return nothing
+end
+
+function _trim_typed_claims_store()::Nothing
+    now = OAuth.Dates.DateTime(2026, 8, 9, 12, 0, 0)
+    stores = OAuth.AuthorizationServerStores(
+        OAuth.AbstractStores.MemoryStore();
+        claims=TrimClaims,
+    )
+    _trim_server_assert(
+        OAuth.claimstype(stores.access_tokens) === TrimClaims,
+        "typed claims store",
+    )
+    claims = _trim_claims()
+    claims["exp"] = OAuth.datetime_to_unix(now + OAuth.Dates.Minute(10))
+    claims["iat"] = OAuth.datetime_to_unix(now)
+    claims["jti"] = "trim-jti"
+    claims["client_id"] = "soleil"
+    claims["tenant"] = "acme"
+    issued = OAuth.IssuedAccessToken(
+        "trim-typed-access-token",
+        claims,
+        ["solar:read", "solar:write"],
+        now,
+        now + OAuth.Dates.Minute(10),
+        "soleil",
+        "user-42",
+        nothing,
+    )
+    OAuth.store_access_token!(stores.access_tokens, issued; now)
+    record = OAuth.lookup_access_token(stores.access_tokens, issued.token)
+    record isa OAuth.AccessTokenRecord{TrimClaims} || error("typed access token record")
+    claims = record.claims
+    _trim_server_assert(claims.tenant == "acme", "typed custom claim")
+    _trim_server_assert(claims.sub == "user-42", "typed subject claim")
+    _trim_server_assert(claims.aud == "https://api.example", "typed audience claim")
+    _trim_server_assert(
+        OAuth.claimget(claims, "iss") == "https://issuer.example",
+        "typed claim lookup",
+    )
+    _trim_server_assert(OAuth.claimget(claims, "unknown") === nothing,
+                        "unknown typed claim lookup")
     return nothing
 end
 
@@ -173,6 +227,7 @@ end
 function run_oauth_trim_server()::Nothing
     _trim_rsa_signing()
     _trim_token_store()
+    _trim_typed_claims_store()
     _trim_authorization_code_store()
     _trim_token_service()
     return nothing

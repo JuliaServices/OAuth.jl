@@ -1,6 +1,6 @@
 name = "OAuth"
 uuid = "22d8b318-f366-56fb-a292-a93f7d76c017"
-version = "4.3.0"
+version = "4.4.0"
 
 [deps]
 AbstractStores = "b8592f88-5fd7-4e10-8c52-04e8e19aea3c"
@@ -12,6 +12,7 @@ JWTs = "d850fbd6-035d-5a70-a269-1ca2e636ac6c"
 OpenSSL_jll = "458c3c95-2e84-50aa-8efc-19380b2a3a95"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+StructUtils = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
 [compat]
@@ -21,6 +22,7 @@ JSON = "1"
 JWTs = "1.1"
 OpenSSL_jll = "3"
 SHA = "0.7"
+StructUtils = "2"
 julia = "1.10"
 
 [extras]
