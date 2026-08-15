@@ -427,9 +427,17 @@ end
 Loads the provided private key, deduces the right signer type, derives the
 public JWK (unless you supply one), and stores other helpful metadata.
 """
-function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, expires_in::Integer=3600, public_jwk=nothing)
+function JWTAccessTokenIssuer(; issuer, audience, private_key=nothing, signer::Union{Nothing,JWTSigner}=nothing, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, expires_in::Integer=3600, public_jwk=nothing)
     alg_symbol = Symbol(uppercase(String(alg)))
-    signer = if alg_symbol in SUPPORTED_RSA_ALGS
+    (private_key === nothing) == (signer === nothing) &&
+        throw(ArgumentError("JWTAccessTokenIssuer needs exactly one of private_key or signer"))
+    # A caller may pass a pre-built signer (`rsa_signer_from_bytes(pem)`, ...);
+    # the issuer's type is then concrete at the call site, where selecting the
+    # signer from the runtime `alg` would make it a union of the three signer
+    # types — the shape a statically compiled (juliac --trim) server needs.
+    signer = if signer !== nothing
+        signer
+    elseif alg_symbol in SUPPORTED_RSA_ALGS
         rsa_signer_from_bytes(private_key)
     elseif alg_symbol in SUPPORTED_EC_ALGS
         curve = alg_symbol == :ES256 ? :P256 : :P384
@@ -602,9 +610,12 @@ function issue_access_token(issuer::JWTAccessTokenIssuer; subject=nothing, clien
         value = get(cnf_claim, "jkt", nothing)
         cnf_thumbprint = value isa AbstractString ? String(value) : nothing
     end
-    header = Dict{String,Any}("typ" => "JWT")
-    issuer.kid !== nothing && (header["kid"] = issuer.kid)
-    token = build_jws_compact(header, claims, issuer.signer, issuer.alg)
+    header = JOSEHeader(; alg=String(issuer.alg), kid=issuer.kid)
+    # Sign the claims in the store's declared shape when there is one, so the
+    # JSON written into the token is a typed struct write rather than a
+    # Dict{String,Any} walk (the same shape the record persists).
+    signed_claims = store === nothing ? claims : storedclaims(claimstype(store), claims)
+    token = build_jws_compact(header, signed_claims, issuer.signer, issuer.alg)
     issued = IssuedAccessToken(token, claims, normalize_string_vector(scope), now, expires_at, client_id === nothing ? nothing : String(client_id), subject === nothing ? nothing : String(subject), cnf_thumbprint)
     store === nothing || store_access_token!(store, issued; now)
     return issued
@@ -626,7 +637,8 @@ public_jwk(issuer::JWTAccessTokenIssuer) = ensure_public_jwk!(issuer)
 token_alg_string(alg::Symbol) = alg == :EDDSA ? "EdDSA" : String(alg)
 
 function derive_signing_jwk(private_key, signer::RSASigner, alg::Symbol, kid::Union{String,Nothing})
-    modulus, exponent = rsa_public_components_from_private_bytes(private_key)
+    # from the key handle, so a pre-built signer (no PEM at hand) works too
+    modulus, exponent = rsa_public_components(signer)
     jwk = Dict(
         "kty" => "RSA",
         "n" => base64urlencode(modulus),
