@@ -449,112 +449,6 @@ function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol
 end
 
 """
-    StoredTokenClaims
-
-The claims of an issued access token as they are persisted with its
-[`AccessTokenRecord`](@ref): the RFC 7519 registered claims plus the RFC 9068
-JWT-access-token-profile members that introspection and validation read back.
-Every field is optional. The token itself may carry additional custom claims
-(see the `extra_claims` keyword of [`issue_access_token`](@ref)); those are
-signed into the JWT but are not part of the stored record.
-
-The shape is deliberately a fixed set of typed fields rather than an open
-`Dict{String,Any}`: it round-trips through typed JSON without dynamic dispatch,
-which keeps token stores usable from statically compiled (`juliac --trim`)
-servers.
-"""
-Base.@kwdef struct StoredTokenClaims
-    iss::Union{Nothing,String} = nothing
-    sub::Union{Nothing,String} = nothing
-    aud::Union{Nothing,String,Vector{String}} = nothing
-    exp::Union{Nothing,Int64} = nothing
-    nbf::Union{Nothing,Int64} = nothing
-    iat::Union{Nothing,Int64} = nothing
-    jti::Union{Nothing,String} = nothing
-    client_id::Union{Nothing,String} = nothing
-    scope::Union{Nothing,String} = nothing
-    auth_time::Union{Nothing,Int64} = nothing
-    azp::Union{Nothing,String} = nothing
-    username::Union{Nothing,String} = nothing
-    cnf::Union{Nothing,Dict{String,String}} = nothing
-    authorization_details::Union{Nothing,Vector{Dict{String,Union{String,Vector{String}}}}} = nothing
-end
-
-# The projection helpers take the claim value from a Dict{String,Any} — an
-# `Any`-typed argument — so they are `@nospecialize`d: one despecialized
-# instance each that the (statically compiled) caller invokes directly, with
-# typed return values.
-_claim_string(@nospecialize(v))::Union{Nothing,String} = v isa String ? v : nothing
-# JSON numbers arrive as Int64 or Float64; an integral Float64 (e.g. an `exp`
-# some issuers write as 1700000000.0) is accepted, anything else is dropped.
-_claim_int(@nospecialize(v))::Union{Nothing,Int64} =
-    v isa Int64 ? v :
-    v isa Float64 && isinteger(v) ? Int64(v) : nothing
-function _claim_strings(@nospecialize(v))::Union{Nothing,Vector{String}}
-    v isa Vector{Any} || return nothing
-    out = String[]
-    for x in v
-        x isa String || return nothing
-        push!(out, x)
-    end
-    return out
-end
-function _claim_string_or_strings(@nospecialize(v))::Union{Nothing,String,Vector{String}}
-    v isa String && return v
-    return _claim_strings(v)
-end
-function _claim_string_dict(@nospecialize(v))::Union{Nothing,Dict{String,String}}
-    v isa Dict{String,Any} || return nothing
-    out = Dict{String,String}()
-    for (k, x) in v
-        x isa String || return nothing
-        out[k] = x
-    end
-    return out
-end
-function _claim_authorization_details(@nospecialize(v))::Union{Nothing,Vector{Dict{String,Union{String,Vector{String}}}}}
-    v isa Vector{Any} || return nothing
-    out = Vector{Dict{String,Union{String,Vector{String}}}}()
-    for item in v
-        item isa Dict{String,Any} || return nothing
-        entry = Dict{String,Union{String,Vector{String}}}()
-        for (k, x) in item
-            member = _claim_string_or_strings(x)
-            member === nothing && return nothing
-            entry[k] = member
-        end
-        push!(out, entry)
-    end
-    return out
-end
-
-"""
-    StoredTokenClaims(claims::AbstractDict) -> StoredTokenClaims
-
-Project a JWT claim set onto the persisted record shape. Recognized claims are
-type-checked and copied; members of unexpected JSON type and unrecognized
-custom claims are dropped (they remain in the signed token).
-"""
-function StoredTokenClaims(claims::AbstractDict)
-    return StoredTokenClaims(;
-        iss=_claim_string(get(claims, "iss", nothing)),
-        sub=_claim_string(get(claims, "sub", nothing)),
-        aud=_claim_string_or_strings(get(claims, "aud", nothing)),
-        exp=_claim_int(get(claims, "exp", nothing)),
-        nbf=_claim_int(get(claims, "nbf", nothing)),
-        iat=_claim_int(get(claims, "iat", nothing)),
-        jti=_claim_string(get(claims, "jti", nothing)),
-        client_id=_claim_string(get(claims, "client_id", nothing)),
-        scope=_claim_string(get(claims, "scope", nothing)),
-        auth_time=_claim_int(get(claims, "auth_time", nothing)),
-        azp=_claim_string(get(claims, "azp", nothing)),
-        username=_claim_string(get(claims, "username", nothing)),
-        cnf=_claim_string_dict(get(claims, "cnf", nothing)),
-        authorization_details=_claim_authorization_details(get(claims, "authorization_details", nothing)),
-    )
-end
-
-"""
     AccessTokenRecord
 
 Stored representation of an issued access token.
@@ -566,7 +460,7 @@ struct AccessTokenRecord
     expires_at::DateTime
     client_id::Union{String,Nothing}
     subject::Union{String,Nothing}
-    claims::StoredTokenClaims
+    claims::Dict{String,Any}
     revoked::Bool
     confirmation_jkt::Union{String,Nothing}
 end
@@ -824,7 +718,7 @@ function store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken;
         issued.expires_at,
         issued.client_id,
         issued.subject,
-        StoredTokenClaims(issued.claims),
+        Dict{String,Any}(issued.claims),
         false,
         issued.confirmation_jkt,
     )
@@ -2937,10 +2831,9 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
         if record === nothing || record.revoked || Dates.now(UTC) > record.expires_at
             return json_no_store_response(Dict("active" => false))
         end
-        claims = record.claims
         response = Dict{String,Any}(
             "active" => true,
-            "iss" => claims.iss,
+            "iss" => get(record.claims, "iss", nothing),
             "client_id" => record.client_id,
             "sub" => record.subject,
             "exp" => datetime_to_unix(record.expires_at),
@@ -2948,12 +2841,12 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
             "scope" => join(record.scope, ' '),
             "token_type" => "access_token",
         )
-        claims.aud === nothing || (response["aud"] = claims.aud)
-        claims.nbf === nothing || (response["nbf"] = claims.nbf)
-        claims.authorization_details === nothing || (response["authorization_details"] = claims.authorization_details)
-        claims.auth_time === nothing || (response["auth_time"] = claims.auth_time)
-        claims.azp === nothing || (response["azp"] = claims.azp)
-        claims.username === nothing || (response["username"] = claims.username)
+        haskey(record.claims, "aud") && (response["aud"] = record.claims["aud"])
+        haskey(record.claims, "nbf") && (response["nbf"] = record.claims["nbf"])
+        haskey(record.claims, "authorization_details") && (response["authorization_details"] = record.claims["authorization_details"])
+        haskey(record.claims, "auth_time") && (response["auth_time"] = record.claims["auth_time"])
+        haskey(record.claims, "azp") && (response["azp"] = record.claims["azp"])
+        haskey(record.claims, "username") && (response["username"] = record.claims["username"])
         return json_no_store_response(response)
     end
     return handler
