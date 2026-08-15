@@ -93,6 +93,33 @@ function _trim_typed_claims_store()::Nothing
     )
     _trim_server_assert(OAuth.claimget(claims, "unknown") === nothing,
                         "unknown typed claim lookup")
+
+    signer = OAuth.rsa_signer_from_bytes(TRIM_PRIVATE_KEY_DER)
+    issuer = OAuth.JWTAccessTokenIssuer(
+        issuer="https://issuer.example",
+        audience=["https://api.example"],
+        signer=signer,
+        alg=:RS256,
+        kid="trim-key",
+        expires_in=600,
+    )
+    minted = OAuth.issue_access_token(
+        issuer;
+        subject="user-42",
+        client_id="soleil",
+        scope=["solar:read", "solar:write"],
+        extra_claims=Dict{String,Any}("tenant" => "acme"),
+        now,
+        store=stores.access_tokens,
+    )
+    _trim_server_assert(occursin(".", minted.token), "signed compact token")
+    minted_record = OAuth.lookup_access_token(stores.access_tokens, minted.token)
+    minted_record isa OAuth.AccessTokenRecord{TrimClaims} ||
+        error("typed minted access token record")
+    _trim_server_assert(minted_record.claims.tenant == "acme", "typed minted claim")
+    jwk = OAuth.public_jwk(issuer)
+    _trim_server_assert(!isempty(jwk["n"]::String), "derived RSA modulus")
+    _trim_server_assert(!isempty(jwk["e"]::String), "derived RSA exponent")
     return nothing
 end
 

@@ -1623,6 +1623,13 @@ end
         extra_claims = Dict{String,Any}("tenant" => "acme", "ignored_by_struct" => 1),
         store = stores.access_tokens,
     )
+    header, payload, _, _ = OAuth.decode_compact_jwt(issued.token)
+    @test header["typ"] == "JWT"
+    @test header["alg"] == "RS256"
+    @test !haskey(header, "kid")
+    @test payload["sub"] == "user-9"
+    @test payload["tenant"] == "acme"
+    @test !haskey(payload, "ignored_by_struct")
     record = lookup_access_token(stores.access_tokens, issued.token)
     @test record isa AccessTokenRecord{AppClaims}
     @test record.claims.sub == "user-9"
@@ -1654,6 +1661,44 @@ end
     @test OAuth.claimstype(default_store) === Dict{String,Any}
     issued2 = issue_access_token(issuer; subject = "user-10", store = default_store)
     @test lookup_access_token(default_store, issued2.token).claims isa Dict{String,Any}
+
+    @test_throws ArgumentError issue_access_token(
+        issuer;
+        subject = "user-11",
+        confirmation_jkt = "thumbprint",
+        store = stores.access_tokens,
+    )
+end
+
+@testset "pre-built access-token signer" begin
+    rsa_pem = fixture_string("rsa_private.pem")
+    signer = OAuth.rsa_signer_from_bytes(rsa_pem)
+    issuer = JWTAccessTokenIssuer(
+        issuer = "https://id.example.com",
+        audience = ["https://api.example.com"],
+        signer = signer,
+        alg = :RS256,
+        kid = "prebuilt-rsa",
+    )
+    jwk = public_jwk(issuer)
+    modulus, exponent = OAuth.rsa_public_components_from_private_bytes(rsa_pem)
+    @test jwk["n"] == OAuth.base64urlencode(modulus)
+    @test jwk["e"] == OAuth.base64urlencode(exponent)
+
+    issued = issue_access_token(issuer; subject = "prebuilt-user")
+    validator = TokenValidationConfig(
+        issuer = "https://id.example.com",
+        audience = ["https://api.example.com"],
+        jwks = Dict("keys" => [jwk]),
+    )
+    @test validate_jwt_access_token(issued.token, validator).subject == "prebuilt-user"
+
+    common = (; issuer="https://id.example.com", audience=["https://api.example.com"])
+    @test_throws ArgumentError JWTAccessTokenIssuer(; common...)
+    @test_throws ArgumentError JWTAccessTokenIssuer(; common..., private_key=rsa_pem, signer=signer)
+    @test_throws ArgumentError JWTAccessTokenIssuer(; common..., signer=signer, alg=:ES256)
+    ec_signer = OAuth.ecc_signer_from_bytes(fixture_string("ec_private.pem"), :P256)
+    @test_throws ArgumentError JWTAccessTokenIssuer(; common..., signer=ec_signer, alg=:ES384)
 end
 
 @testset "Server helpers" begin
@@ -1881,6 +1926,8 @@ end
         kid = "ed-kid",
     )
     ed_token = issue_access_token(ed_issuer; subject = "ed-user")
+    ed_header, _, _, _ = OAuth.decode_compact_jwt(ed_token.token)
+    @test ed_header["alg"] == "EdDSA"
     ed_jwk = public_jwk(ed_issuer)
     @test ed_jwk["kty"] == "OKP"
     ed_validator = TokenValidationConfig(
