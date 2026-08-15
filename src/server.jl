@@ -453,16 +453,46 @@ end
 
 Stored representation of an issued access token.
 """
-struct AccessTokenRecord
+struct AccessTokenRecord{C}
     token::String
     scope::Vector{String}
     issued_at::DateTime
     expires_at::DateTime
     client_id::Union{String,Nothing}
     subject::Union{String,Nothing}
-    claims::Dict{String,Any}
+    claims::C
     revoked::Bool
     confirmation_jkt::Union{String,Nothing}
+end
+
+# Default: the claims persist as they were issued, an open `Dict{String,Any}`.
+AccessTokenRecord(token, scope, issued_at, expires_at, client_id, subject, claims::Dict{String,Any}, revoked, confirmation_jkt) =
+    AccessTokenRecord{Dict{String,Any}}(token, scope, issued_at, expires_at, client_id, subject, claims, revoked, confirmation_jkt)
+
+"""
+    OAuth.claimstype(store::AccessTokenStore) -> Type
+
+The claims type `C` of the `AccessTokenRecord{C}` values a token store holds.
+`Dict{String,Any}` by default; a custom claims struct when the store was built
+with `AuthorizationServerStores(backend; claims=MyClaims)` or typed directly as
+`AbstractStore{AccessTokenRecord{MyClaims}}`.
+"""
+claimstype(::AbstractStore{AccessTokenRecord{C}}) where {C} = C
+claimstype(::AbstractStore{AccessTokenRecord}) = Dict{String,Any}
+
+# Convert an issued claim set into the store's claims type. The default keeps
+# the dict as is; a custom struct is built with StructUtils' typed
+# construction, so a JSON-backed store round-trips it through typed reads and
+# writes — the shape a statically compiled (`juliac --trim`) server needs.
+storedclaims(::Type{Dict{String,Any}}, claims::Dict{String,Any}) = claims
+storedclaims(::Type{C}, claims::Dict{String,Any}) where {C} = StructUtils.make(C, claims)
+
+# Read one claim from a stored claims value: a dict lookup, or a field of a
+# custom claims struct (`nothing` when the struct has no such field).
+claimget(claims::AbstractDict, name::String) = get(claims, name, nothing)
+function claimget(claims::T, name::String) where {T}
+    sym = Symbol(name)
+    return hasfield(T, sym) ? getfield(claims, sym) : nothing
 end
 
 """
@@ -480,7 +510,7 @@ Expired records are never returned, but a store that does not expire entries
 natively — `MemoryStore`, `FileStore` — only reclaims one when it is read. Call
 `AbstractStores.sweep!` periodically on a long-lived store.
 """
-const AccessTokenStore = AbstractStore{AccessTokenRecord}
+const AccessTokenStore = AbstractStore{<:AccessTokenRecord}
 
 """
     InMemoryTokenStore()
@@ -711,14 +741,15 @@ filesystem filename limits.
 """
 function store_access_token!(store::AccessTokenStore, issued::IssuedAccessToken;
                              now::DateTime=Dates.now(UTC))
-    record = AccessTokenRecord(
+    C = claimstype(store)
+    record = AccessTokenRecord{C}(
         issued.token,
         copy(issued.scope),
         issued.issued_at,
         issued.expires_at,
         issued.client_id,
         issued.subject,
-        Dict{String,Any}(issued.claims),
+        storedclaims(C, Dict{String,Any}(issued.claims)),
         false,
         issued.confirmation_jkt,
     )
@@ -1029,15 +1060,15 @@ return stored values without changing their types. Use the keyword constructor
 with three independently typed stores when the backend codec cannot provide
 that guarantee.
 """
-function AuthorizationServerStores(backend::AbstractStore)
-    for T in (AccessTokenRecord, AuthorizationCodeRecord, RefreshTokenGrantRecord)
+function AuthorizationServerStores(backend::AbstractStore; claims::Type=Dict{String,Any})
+    for T in (AccessTokenRecord{claims}, AuthorizationCodeRecord, RefreshTokenGrantRecord)
         eltype(backend) >: T || throw(ArgumentError(
             "AuthorizationServerStores needs a backend whose eltype can hold $T; " *
             "got $(typeof(backend)) with eltype $(eltype(backend)). Pass a store " *
             "parameterized on `Any`, or build one typed store per record type."))
     end
     return AuthorizationServerStores(
-        PrefixedStore{AccessTokenRecord}(backend, "oauth/access/"),
+        PrefixedStore{AccessTokenRecord{claims}}(backend, "oauth/access/"),
         PrefixedStore{AuthorizationCodeRecord}(backend, "oauth/code/"),
         PrefixedStore{RefreshTokenGrantRecord}(backend, "oauth/refresh/"),
     )
@@ -1099,15 +1130,15 @@ The authorization-code store must additionally be atomic and TTL-capable — see
 compare-and-swap, so it is rejected for authorization codes; it remains fine for
 access-token state in a single service process.
 """
-function authorization_server_stores(backend::AbstractStore)
-    for T in (AccessTokenRecord, AuthorizationCodeRecord, RefreshTokenGrantRecord)
+function authorization_server_stores(backend::AbstractStore; claims::Type=Dict{String,Any})
+    for T in (AccessTokenRecord{claims}, AuthorizationCodeRecord, RefreshTokenGrantRecord)
         eltype(backend) >: T || throw(ArgumentError(
             "authorization_server_stores needs a backend whose eltype can hold $T; " *
             "got $(typeof(backend)) with eltype $(eltype(backend)). Pass a store " *
             "parameterized on `Any`, or build one typed store per record type."))
     end
     return (
-        access_tokens=PrefixedStore{AccessTokenRecord}(
+        access_tokens=PrefixedStore{AccessTokenRecord{claims}}(
             backend,
             "oauth/access/",
         ),
@@ -2831,9 +2862,10 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
         if record === nothing || record.revoked || Dates.now(UTC) > record.expires_at
             return json_no_store_response(Dict("active" => false))
         end
+        claims = record.claims
         response = Dict{String,Any}(
             "active" => true,
-            "iss" => get(record.claims, "iss", nothing),
+            "iss" => claimget(claims, "iss"),
             "client_id" => record.client_id,
             "sub" => record.subject,
             "exp" => datetime_to_unix(record.expires_at),
@@ -2841,12 +2873,10 @@ function build_introspection_handler(store::AccessTokenStore; authenticator::Uni
             "scope" => join(record.scope, ' '),
             "token_type" => "access_token",
         )
-        haskey(record.claims, "aud") && (response["aud"] = record.claims["aud"])
-        haskey(record.claims, "nbf") && (response["nbf"] = record.claims["nbf"])
-        haskey(record.claims, "authorization_details") && (response["authorization_details"] = record.claims["authorization_details"])
-        haskey(record.claims, "auth_time") && (response["auth_time"] = record.claims["auth_time"])
-        haskey(record.claims, "azp") && (response["azp"] = record.claims["azp"])
-        haskey(record.claims, "username") && (response["username"] = record.claims["username"])
+        for name in ("aud", "nbf", "authorization_details", "auth_time", "azp", "username")
+            value = claimget(claims, name)
+            value === nothing || (response[name] = value)
+        end
         return json_no_store_response(response)
     end
     return handler

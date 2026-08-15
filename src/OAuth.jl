@@ -1,7 +1,7 @@
 module OAuth
 
 using AbstractStores
-using Dates, HTTP, JSON, JWTs, Random, SHA, OpenSSL_jll, FileWatching
+using Dates, HTTP, JSON, JWTs, Random, SHA, OpenSSL_jll, FileWatching, StructUtils
 
 const DEFAULT_RESPONSE_TYPE = "code"
 const MAX_DPOP_NONCE_RETRIES = 1
@@ -46,7 +46,7 @@ export stop_loopback_listener
 export DEFAULT_LOOPBACK_HOST, DEFAULT_LOOPBACK_PORT, DEFAULT_LOOPBACK_PATH
 export ProtectedResourceConfig, AuthorizationServerConfig, JWTAccessTokenIssuer, IssuedAccessToken
 export AccessTokenClaims, TokenValidationConfig, DPoPReplayCache, DeviceAuthorizationResponse
-export AccessTokenStore, AccessTokenRecord, InMemoryTokenStore
+export AccessTokenStore, AccessTokenRecord, InMemoryTokenStore, claimstype
 export AllowAllAuthenticator, BasicCredentialsAuthenticator
 export register_protected_resource_metadata!, register_authorization_server_metadata!
 export register_jwks_endpoint!, protected_resource_middleware, public_jwk, DEFAULT_JWKS_PATH
