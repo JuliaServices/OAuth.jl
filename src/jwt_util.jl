@@ -88,6 +88,12 @@ const SUPPORTED_RSA_ALGS = Set([:RS256, :PS256])
 const SUPPORTED_EC_ALGS = Set([:ES256, :ES384])
 const SUPPORTED_OKP_ALGS = Set([:EDDSA])
 
+signer_supports_alg(::RSASigner, alg::Symbol) = alg in SUPPORTED_RSA_ALGS
+signer_supports_alg(signer::ECSigner, alg::Symbol) =
+    (signer.curve === :P256 && alg === :ES256) ||
+    (signer.curve === :P384 && alg === :ES384)
+signer_supports_alg(::EdDSASigner, alg::Symbol) = alg in SUPPORTED_OKP_ALGS
+
 # OAuth normalizes algorithm symbols to uppercase; JWTs speaks RFC 7518 names.
 jose_alg_name(alg::Symbol) = alg === :EDDSA ? "EdDSA" : String(alg)
 
@@ -500,9 +506,40 @@ const JWK_PRIVATE_MEMBERS = ("d", "p", "q", "dp", "dq", "qi", "oth", "k")
 jwk_has_private_material(jwk::Dict{String,String}) = any(member -> haskey(jwk, member), JWK_PRIVATE_MEMBERS)
 jwk_has_private_material(jwk::AbstractDict) = any(member -> haskey(jwk, member), JWK_PRIVATE_MEMBERS)
 
-function build_jws_compact(header::Dict{String,Any}, payload::Dict{String,Any}, signer::JWTSigner, alg::Symbol)
-    header["alg"] = String(alg)
-    header_json = JSON.json(header)
+"""
+    JOSEHeader(; typ="JWT", alg, kid=nothing)
+
+The JOSE header of a signed token. A fixed shape (RFC 7515 §4.1: `typ`, `alg`,
+`kid`), so it serializes through a typed JSON write; `kid` is omitted when
+absent.
+"""
+Base.@kwdef struct JOSEHeader
+    typ::String = "JWT"
+    alg::String = ""
+    kid::Union{Nothing,String} = nothing
+end
+
+joseheader_json(h::JOSEHeader) = JSON.json(h; omit_null=true)
+
+# `header` is a `JOSEHeader` (typed write) or a `Dict{String,Any}` for callers
+# that need extra members; `payload` is likewise the open claim set or an
+# application-declared claims struct (see `AuthorizationServerStores(...;
+# claims=...)`), whose JSON write is then fully typed.
+function build_jws_compact(header::JOSEHeader, payload, signer::JWTSigner, alg::Symbol)
+    return _build_jws(
+        joseheader_json(JOSEHeader(header.typ, jose_alg_name(alg), header.kid)),
+        payload,
+        signer,
+        alg,
+    )
+end
+
+function build_jws_compact(header::Dict{String,Any}, payload, signer::JWTSigner, alg::Symbol)
+    header["alg"] = jose_alg_name(alg)
+    return _build_jws(JSON.json(header), payload, signer, alg)
+end
+
+function _build_jws(header_json::String, payload, signer::JWTSigner, alg::Symbol)
     payload_json = JSON.json(payload)
     encoded_header = base64urlencode(header_json)
     encoded_payload = base64urlencode(payload_json)
@@ -662,6 +699,43 @@ function unwrap_pkcs8_private_key(bytes::Vector{UInt8})
     key_len, consumed = read_der_length(bytes, idx)
     idx += consumed
     return copy(bytes[idx:idx + key_len - 1])
+end
+
+"""
+    rsa_public_components(signer::RSASigner) -> (modulus, exponent)
+
+Big-endian modulus and public exponent read from the loaded key itself, so a
+JWK can be derived from a signer built without the PEM bytes at hand.
+"""
+function rsa_public_components(signer::RSASigner)
+    key = signer.key
+    n = _evp_bn_param(key, "n")
+    e = _evp_bn_param(key, "e")
+    return n, e
+end
+
+function _evp_bn_param(key::JWTs.OpenSSLKey, name::String)
+    bn_ref = Ref{Ptr{Cvoid}}(C_NULL)
+    ok = GC.@preserve key ccall(
+        (:EVP_PKEY_get_bn_param, LIBCRYPTO),
+        Cint,
+        (Ptr{Cvoid}, Cstring, Ref{Ptr{Cvoid}}),
+        key.ptr, name, bn_ref,
+    )
+    JWTs.require_openssl_ok(ok, "EVP_PKEY_get_bn_param($name)")
+    bn = bn_ref[]
+    JWTs.require_openssl_nonnull(bn, "EVP_PKEY_get_bn_param($name)")
+    try
+        nbytes = Int(ccall((:BN_num_bits, LIBCRYPTO), Cint, (Ptr{Cvoid},), bn) + 7) ÷ 8
+        nbytes > 0 || error("EVP_PKEY_get_bn_param($name) returned an empty integer")
+        out = Vector{UInt8}(undef, nbytes)
+        written = GC.@preserve out ccall((:BN_bn2bin, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{UInt8}), bn, pointer(out))
+        Int(written) == nbytes || error(
+            "BN_bn2bin($name) wrote $(Int(written)) bytes; expected $nbytes")
+        return out
+    finally
+        JWTs.free_bn!(bn)
+    end
 end
 
 function rsa_public_components_from_private_bytes(raw)

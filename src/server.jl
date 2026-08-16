@@ -422,14 +422,24 @@ mutable struct JWTAccessTokenIssuer{S<:JWTSigner}
 end
 
 """
-    JWTAccessTokenIssuer(; issuer, audience, private_key, alg=:RS256, kid=nothing, expires_in=3600, public_jwk=nothing)
+    JWTAccessTokenIssuer(; issuer, audience, private_key=nothing, signer=nothing,
+                         alg=:RS256, kid=nothing, expires_in=3600, public_jwk=nothing)
 
-Loads the provided private key, deduces the right signer type, derives the
-public JWK (unless you supply one), and stores other helpful metadata.
+Provide exactly one of `private_key` or a pre-built `signer`. The constructor
+checks that the signer, algorithm, and EC curve agree. It derives the public JWK
+unless you supply one, and stores other helpful metadata.
 """
-function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, expires_in::Integer=3600, public_jwk=nothing)
+function JWTAccessTokenIssuer(; issuer, audience, private_key=nothing, signer::Union{Nothing,JWTSigner}=nothing, alg::Union{Symbol,AbstractString}=:RS256, kid=nothing, expires_in::Integer=3600, public_jwk=nothing)
     alg_symbol = Symbol(uppercase(String(alg)))
-    signer = if alg_symbol in SUPPORTED_RSA_ALGS
+    (private_key === nothing) == (signer === nothing) &&
+        throw(ArgumentError("JWTAccessTokenIssuer needs exactly one of private_key or signer"))
+    # A caller may pass a pre-built signer (`rsa_signer_from_bytes(pem)`, ...);
+    # the issuer's type is then concrete at the call site, where selecting the
+    # signer from the runtime `alg` would make it a union of the three signer
+    # types — the shape a statically compiled (juliac --trim) server needs.
+    signer = if signer !== nothing
+        signer
+    elseif alg_symbol in SUPPORTED_RSA_ALGS
         rsa_signer_from_bytes(private_key)
     elseif alg_symbol in SUPPORTED_EC_ALGS
         curve = alg_symbol == :ES256 ? :P256 : :P384
@@ -439,6 +449,8 @@ function JWTAccessTokenIssuer(; issuer, audience, private_key, alg::Union{Symbol
     else
         throw(ArgumentError("Unsupported signing alg $(alg_symbol)"))
     end
+    signer_supports_alg(signer, alg_symbol) || throw(ArgumentError(
+        "$(typeof(signer)) cannot sign with $(token_alg_string(alg_symbol))"))
     aud = normalize_string_vector(audience)
     kid_value = maybe_string(kid)
     jwk_dict = public_jwk === nothing ? derive_signing_jwk(private_key, signer, alg_symbol, kid_value) : normalize_metadata_dict(public_jwk)
@@ -503,6 +515,34 @@ storedclaims(::Type{Dict{String,Any}}, claims::Dict{String,Any}) = claims
         push!(values, :(get(claims, $key, nothing)::$field_type))
     end
     return :($C($(values...)))
+end
+
+const REGISTERED_ACCESS_TOKEN_CLAIMS = (
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "iat",
+    "jti",
+    "client_id",
+    "scope",
+    "authorization_details",
+    "cnf",
+)
+
+validate_mint_claim_shape(::Type{Dict{String,Any}}, ::Dict{String,Any}) = nothing
+@generated function validate_mint_claim_shape(::Type{C}, claims::Dict{String,Any}) where {C}
+    if !(C isa DataType && isconcretetype(C) && isstructtype(C))
+        return :(throw(ArgumentError("access-token claims type $C must be a concrete struct")))
+    end
+    fields = Set(String.(fieldnames(C)))
+    checks = Any[]
+    for claim in REGISTERED_ACCESS_TOKEN_CLAIMS
+        claim in fields && continue
+        message = "access-token claims type $C has no field :$claim; minting would drop the $claim claim"
+        push!(checks, :(haskey(claims, $claim) && throw(ArgumentError($message))))
+    end
+    return Expr(:block, checks..., :(return nothing))
 end
 
 # Read one claim from a stored claims value: a dict lookup, or a field of a
@@ -571,12 +611,14 @@ to embed DPoP confirmation claims.
 """
 function issue_access_token(issuer::JWTAccessTokenIssuer; subject=nothing, client_id=nothing, scope=String[], authorization_details=nothing, extra_claims=Dict{String,Any}(), audience=nothing, now::DateTime=Dates.now(UTC), store::Union{Nothing,AccessTokenStore}=nothing, confirmation=nothing, confirmation_jkt=nothing)
     expires_at = now + Dates.Second(issuer.expires_in)
-    claims = Dict{String,Any}(
-        "iss" => issuer.issuer,
-        "aud" => token_audience(issuer, audience),
-        "exp" => datetime_to_unix(expires_at),
-        "iat" => datetime_to_unix(now),
-    )
+    # Build the heterogeneous dictionary one entry at a time. The vararg Pair
+    # constructor iterates through `Pair` values whose second field is `Any`,
+    # which leaves a dynamic `setindex!` call in trim-compiled applications.
+    claims = Dict{String,Any}()
+    claims["iss"] = issuer.issuer
+    claims["aud"] = token_audience(issuer, audience)
+    claims["exp"] = datetime_to_unix(expires_at)
+    claims["iat"] = datetime_to_unix(now)
     subject !== nothing && (claims["sub"] = String(subject))
     client_id !== nothing && (claims["client_id"] = String(client_id))
     !isempty(scope) && (claims["scope"] = join(String.(scope), ' '))
@@ -602,9 +644,18 @@ function issue_access_token(issuer::JWTAccessTokenIssuer; subject=nothing, clien
         value = get(cnf_claim, "jkt", nothing)
         cnf_thumbprint = value isa AbstractString ? String(value) : nothing
     end
-    header = Dict{String,Any}("typ" => "JWT")
-    issuer.kid !== nothing && (header["kid"] = issuer.kid)
-    token = build_jws_compact(header, claims, issuer.signer, issuer.alg)
+    header = JOSEHeader(; alg=jose_alg_name(issuer.alg), kid=issuer.kid)
+    # Sign the claims in the store's declared shape when there is one, so the
+    # JSON written into the token is a typed struct write rather than a
+    # Dict{String,Any} walk (the same shape the record persists).
+    signed_claims = if store === nothing
+        claims
+    else
+        C = claimstype(store)
+        validate_mint_claim_shape(C, claims)
+        storedclaims(C, claims)
+    end
+    token = build_jws_compact(header, signed_claims, issuer.signer, issuer.alg)
     issued = IssuedAccessToken(token, claims, normalize_string_vector(scope), now, expires_at, client_id === nothing ? nothing : String(client_id), subject === nothing ? nothing : String(subject), cnf_thumbprint)
     store === nothing || store_access_token!(store, issued; now)
     return issued
@@ -626,7 +677,8 @@ public_jwk(issuer::JWTAccessTokenIssuer) = ensure_public_jwk!(issuer)
 token_alg_string(alg::Symbol) = alg == :EDDSA ? "EdDSA" : String(alg)
 
 function derive_signing_jwk(private_key, signer::RSASigner, alg::Symbol, kid::Union{String,Nothing})
-    modulus, exponent = rsa_public_components_from_private_bytes(private_key)
+    # from the key handle, so a pre-built signer (no PEM at hand) works too
+    modulus, exponent = rsa_public_components(signer)
     jwk = Dict(
         "kty" => "RSA",
         "n" => base64urlencode(modulus),

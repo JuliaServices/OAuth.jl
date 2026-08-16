@@ -362,6 +362,22 @@ register_jwks_endpoint!(router, [public_jwk(token_issuer)])
 
 `JWTAccessTokenIssuer` signs tokens, and the optional `AccessTokenStore` captures issued tokens for introspection and revocation. Server stores use the `AbstractStores.jl` interface. The application can therefore choose process memory, files, Redis, SQL, or another conforming backend. Tokens inherit scopes, authorization details, audiences, confirmation (`cnf`) claims, and extra custom claims in a single call.
 
+A statically compiled service can build its signer before issuer construction:
+
+```julia
+signer = OAuth.rsa_signer_from_bytes(read("keys/token-signing.pem"))
+token_issuer = JWTAccessTokenIssuer(
+    issuer="https://id.example",
+    audience=["https://api.example"],
+    signer=signer,
+    alg=:RS256,
+    kid="token-key-1",
+)
+```
+
+Provide exactly one of `private_key` or `signer`. OAuth rejects an algorithm or
+EC curve that does not match the signer.
+
 ```julia
 token_store = InMemoryTokenStore()
 issued = issue_access_token(
@@ -418,7 +434,9 @@ same three stores as a named tuple.
 Access-token claims use `Dict{String,Any}` by default. A trim-compiled service,
 or a service that wants typed JSON persistence, can declare its exact claim
 shape. Field names match JWT claim names. Optional fields include `Nothing`;
-unknown claims are dropped.
+unknown custom claims are dropped. The shape must include each registered claim
+that token minting uses. OAuth raises an error instead of silently dropping a
+registered claim such as `exp`, `scope`, or `cnf`.
 
 ```julia
 Base.@kwdef struct AccessClaims
