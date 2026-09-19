@@ -249,6 +249,25 @@ end
     @test params.params == Dict("realm" => "", "error" => "invalid_token")
 end
 
+@testset "Authentication parameter case and repeated fields" begin
+    parsed = only(parse_www_authenticate("Basic ReAlM=\"MiXeD\""))
+    @test parsed.params == Dict("realm" => "MiXeD")
+    for prefix in (Pair{String,String}[], [
+        "WWW-Authenticate" => "Basic realm=\"first\"",
+        "X-Other" => "separate",
+    ])
+        response = HTTP.Response(401, vcat(prefix, [
+            "WWW-Authenticate" => "DPoP ErRoR=use_dpop_nonce, NoNcE=\"MiXeD\"",
+        ]))
+        @test OAuth.requires_dpop_nonce_retry(response)
+        @test OAuth.dpop_nonce_from_response(response) == "MiXeD"
+        HTTP.setheader(response, "DPoP-Nonce" => "Preferred")
+        @test OAuth.dpop_nonce_from_response(response) == "Preferred"
+    end
+    @test !OAuth.requires_dpop_nonce_retry(HTTP.Response(401))
+    @test OAuth.dpop_nonce_from_response(HTTP.Response(401)) === nothing
+end
+
 @testset "Security validations" begin
     function expect_oauth_error(f, code)
         err = try

@@ -4,6 +4,7 @@
 Parses an RFC 9110 `WWW-Authenticate` header into a structured list of
 `WWWAuthenticateChallenge` values. The parser handles bare or padded token68
 values, quoted strings, extension parameters, and extra commas between entries.
+Parameter names are stored in lowercase; parameter values retain their case.
 
 # Examples
 ```julia
@@ -70,7 +71,7 @@ function parse_www_authenticate(header::AbstractString)
                 idx = Base.nextind(header, idx)
                 idx = skip_spaces(header, idx, stop)
                 value, idx = read_value(header, idx, stop)
-                params[String(key)] = value
+                params[lowercase(key)] = value
                 seen_param = true
             else
                 if seen_param || token !== nothing
