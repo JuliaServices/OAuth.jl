@@ -40,6 +40,7 @@ function parse_www_authenticate(header::AbstractString)
                     idx = after_peek
                     continue
                 end
+                after_peek = skip_spaces(header, after_peek, stop)
                 if after_peek <= stop && header[after_peek] == '='
                     idx = peek_idx
                 else

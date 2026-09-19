@@ -214,6 +214,22 @@ end
     @test length(multi_chals) == 2
     @test multi_chals[2].scheme == "Basic"
     @test multi_chals[2].params["realm"] == "legacy"
+
+    for whitespace in ("", " ", "\t", " \t")
+        spaced = "Bearer realm=\"api\", error$(whitespace)=$(whitespace)\"invalid_token\", Basic realm=\"backup\""
+        parsed = parse_www_authenticate(spaced)
+        @test length(parsed) == 2
+        @test parsed[1].scheme == "Bearer"
+        @test parsed[1].params["error"] == "invalid_token"
+        @test parsed[2].scheme == "Basic"
+        @test parsed[2].params["realm"] == "backup"
+
+        response = HTTP.Response(401, [
+            "WWW-Authenticate" => "DPoP realm=\"api\", error$(whitespace)=$(whitespace)use_dpop_nonce, nonce$(whitespace)=$(whitespace)\"fresh\"",
+        ])
+        @test OAuth.requires_dpop_nonce_retry(response)
+        @test OAuth.dpop_nonce_from_response(response) == "fresh"
+    end
 end
 
 @testset "Security validations" begin
