@@ -232,6 +232,23 @@ end
     end
 end
 
+@testset "Padded authentication challenge tokens" begin
+    for token in ("abc=", "abc==", "azAZ09-._~+/=="), whitespace in ("", " \t")
+        parsed = OAuth.parse_www_authenticate("Negotiate $token$whitespace, Basic realm=\"backup\"")
+        @test length(parsed) == 2
+        @test parsed[1].scheme == "Negotiate"
+        @test parsed[1].token == token
+        @test isempty(parsed[1].params)
+        @test parsed[2].params["realm"] == "backup"
+        single = only(OAuth.parse_www_authenticate("Negotiate $token$whitespace"))
+        @test single.token == token
+        @test isempty(single.params)
+    end
+    params = only(OAuth.parse_www_authenticate("Bearer realm = \"\", error = invalid_token"))
+    @test params.token === nothing
+    @test params.params == Dict("realm" => "", "error" => "invalid_token")
+end
+
 @testset "Security validations" begin
     function expect_oauth_error(f, code)
         err = try
