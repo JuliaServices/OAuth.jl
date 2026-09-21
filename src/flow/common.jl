@@ -18,19 +18,19 @@ function dpop_nonce_from_response(resp::HTTP.Response)
     if !isempty(nonce_header)
         return String(nonce_header)
     end
-    www_value = header_value(resp.headers, "WWW-Authenticate", "")
-    isempty(www_value) && return nothing
-    try
-        for challenge in parse_www_authenticate(www_value)
-            ascii_lc_isequal(challenge.scheme, "dpop") || continue
-            nonce = get(challenge.params, "nonce", nothing)
-            nonce !== nothing && return String(nonce)
+    for (name, www_value) in resp.headers
+        ascii_lc_isequal(name, "WWW-Authenticate") || continue
+        try
+            for challenge in parse_www_authenticate(www_value)
+                ascii_lc_isequal(challenge.scheme, "dpop") || continue
+                nonce = get(challenge.params, "nonce", nothing)
+                nonce !== nothing && return String(nonce)
+            end
+        catch
+            occursin("dpop", lowercase(String(www_value))) || continue
+            nonce_match = match(r"nonce=\"([^\"]+)\"", String(www_value))
+            nonce_match === nothing || return String(nonce_match.captures[1])
         end
-    catch
-        lower = lowercase(String(www_value))
-        occursin("dpop", lower) || return nothing
-        match = match(r"nonce=\"([^\"]+)\"", String(www_value))
-        return match === nothing ? nothing : String(match.captures[1])
     end
     return nothing
 end
