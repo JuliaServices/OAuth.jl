@@ -117,18 +117,9 @@ end
     expected_token = OAuth.base64url(rand(expected_rng, UInt8, 24))
     @test token == expected_token
 
-    function pkce_expected(bytes, rng_seed)
-        source = MersenneTwister(rng_seed)
-        verifier = ""
-        while !(OAuth.PKCE_VERIFIER_MIN <= length(verifier) <= OAuth.PKCE_VERIFIER_MAX)
-            candidate = OAuth.secure_random_bytes(bytes; rng=source)
-            verifier = OAuth.base64url(candidate)
-        end
-        return verifier
-    end
     rng_seed = 77
     verifier = OAuth.generate_pkce_verifier(rng=MersenneTwister(rng_seed), bytes=48)
-    @test verifier.verifier == pkce_expected(48, rng_seed)
+    @test verifier.verifier == OAuth.base64url(rand(MersenneTwister(rng_seed), UInt8, 48))
 end
 
 @testset "TokenResponse parsing" begin
@@ -757,6 +748,16 @@ end
     @test payload["state"] == "fixed-state"
 end
 
+mutable struct PKCETestRNG <: AbstractRNG
+    calls::Int
+end
+
+function Random.rand(rng::PKCETestRNG, ::Type{UInt8}, bytes::Integer)
+    rng.calls += 1
+    rng.calls == 1 || error("PKCE generation must not retry a fixed-length encoding")
+    return zeros(UInt8, bytes)
+end
+
 @testset "PKCE utilities" begin
     verifier = generate_pkce_verifier()
     @test OAuth.PKCE_VERIFIER_MIN <= length(verifier.verifier) <= OAuth.PKCE_VERIFIER_MAX
@@ -764,6 +765,18 @@ end
     @test !isempty(challenge)
     bad = "short"
     @test_throws ArgumentError pkce_challenge(bad)
+    for bytes in 32:96
+        rng = PKCETestRNG(0)
+        value = generate_pkce_verifier(; bytes, rng).verifier
+        @test ncodeunits(value) == cld(4bytes, 3)
+        @test OAuth.valid_pkce_value(value)
+        @test rng.calls == 1
+    end
+    for bytes in (-1, 0, 1, 31, 97, typemax(Int))
+        rng = PKCETestRNG(0)
+        @test_throws ArgumentError generate_pkce_verifier(; bytes, rng)
+        @test rng.calls == 0
+    end
 end
 
 @testset "Authorization flow helpers" begin
