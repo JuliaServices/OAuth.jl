@@ -54,8 +54,8 @@ end
 """
     LoopbackListener
 
-Represents the tiny HTTP server the PKCE helpers spin up on
-`http://127.0.0.1` so the system browser can post the authorization code
+Represents the tiny HTTP server the PKCE helpers spin up on a loopback
+interface (`127.0.0.1` by default) so the system browser can post the authorization code
 back to your app.  The struct holds the running `HTTP.Server`, the async
 `Task` that drives it, a `Channel` where captured query parameters are
 delivered, plus the host/port/path that callers can present to an
@@ -83,7 +83,9 @@ struct LoopbackListener
     path::String
 end
 
-loopback_url(listener::LoopbackListener) = "http://$(listener.host):$(listener.port)$(listener.path)"
+loopback_url(host::AbstractString, port::Integer, path::AbstractString) =
+    string(HTTP.URI(scheme="http", host=host, port=string(port), path=path))
+loopback_url(listener::LoopbackListener) = loopback_url(listener.host, listener.port, listener.path)
 
 Base.isopen(listener::LoopbackListener) = !istaskdone(listener.task)
 
@@ -100,8 +102,8 @@ const DEFAULT_LOOPBACK_HOST = "127.0.0.1"
     DEFAULT_LOOPBACK_PORT
 
 The TCP port the loopback listener tries first.  When you need to run
-multiple concurrent PKCE sessions, increment this value or pass an explicit
-port to `start_pkce_authorization`.
+multiple concurrent PKCE sessions, pass another port or use `listener_port=0`
+with `start_pkce_authorization` to let the operating system select an available port.
 """
 const DEFAULT_LOOPBACK_PORT = 5338
 
@@ -524,7 +526,7 @@ function start_loopback_listener(host::AbstractString, port::Integer, path::Abst
             verbose && @warn "Loopback server stopped" err
         end
     end
-    return LoopbackListener(server, task, channel, String(host), Int(port), normalized_path)
+    return LoopbackListener(server, task, channel, String(host), HTTP.port(server), normalized_path)
 end
 
 """
