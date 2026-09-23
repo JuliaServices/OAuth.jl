@@ -4,10 +4,10 @@ const PKCE_VERIFIER_MAX = 128
 """
     generate_pkce_verifier(; rng=RandomDevice(), bytes=32) -> PKCEVerifier
 
-Builds a cryptographically strong PKCE code verifier string.  Internally we
-generate random bytes, base64url encode them, and re-roll until the length
-lands within the S256-friendly 43–128 character window.  You can inject a
-custom RNG (for deterministic tests) or request more entropy via `bytes`.
+Builds a cryptographically strong PKCE code verifier string from `bytes` random
+bytes encoded as unpadded base64url. `bytes` must be between 32 and 96 inclusive,
+which produces a verifier within the required 43–128 character window. You can
+inject a custom RNG for deterministic tests or request more entropy via `bytes`.
 
 # Examples
 ```julia
@@ -15,18 +15,12 @@ julia> verifier = generate_pkce_verifier()
 PKCEVerifier(\"Qnaz2EG3...\" )
 
 julia> verifier.verifier |> length
-64
+43
 ```
 """
 function generate_pkce_verifier(; rng=nothing, bytes=32)
-    bytes > 0 || throw(ArgumentError("bytes must be positive"))
-    verifier = ""
-    source = rng === nothing ? RandomDevice() : rng
-    while !within_pkce_length(verifier)
-        seed = secure_random_bytes(bytes; rng=source)
-        verifier = base64url(seed)
-    end
-    return PKCEVerifier(verifier)
+    32 <= bytes <= 96 || throw(ArgumentError("bytes must be between 32 and 96"))
+    return PKCEVerifier(base64url(secure_random_bytes(bytes; rng=rng)))
 end
 
 function within_pkce_length(verifier)
