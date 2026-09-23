@@ -1519,6 +1519,44 @@ end
 
 warmup_http_client()
 
+@testset "Loopback callback addresses" begin
+    issuer = "https://id.loopback.example"
+    metadata = Dict(
+        "issuer" => issuer,
+        "authorization_endpoint" => "$(issuer)/authorize",
+        "token_endpoint" => "$(issuer)/token",
+        "code_challenge_methods_supported" => ["S256"],
+    )
+    mock_http = (get = (url; kwargs...) -> HTTP.Response(200, JSON.json(metadata)),)
+    for (host, port, explicit_redirect) in (("127.0.0.1", 0, false), ("::1", 0, false), ("::1", free_port(), true))
+        authority_host = host == "::1" ? "[::1]" : host
+        configured_redirect = explicit_redirect ? "http://$(authority_host):$(port)/oauth/callback" : nothing
+        config = PublicClientConfig(client_id="loopback-client", redirect_uri=configured_redirect)
+        session = start_pkce_authorization_from_issuer(
+            issuer, config;
+            http=mock_http, open_browser=false, listener_host=host, listener_port=port,
+        )
+        try
+            @test session.listener !== nothing
+            session.listener === nothing && continue
+            bound_port = HTTP.port(session.listener.server)
+            expected = "http://$(authority_host):$(bound_port)/oauth/callback"
+            @test bound_port > 0
+            @test session.listener.port == bound_port
+            @test OAuth.loopback_url(session.listener) == expected
+            @test session.redirect_uri == expected
+            @test session.client_config.redirect_uri == expected
+            @test HTTP.URIs.queryparams(HTTP.URI(session.authorization_url))["redirect_uri"] == expected
+            response = HTTP.get("$(expected)?code=local-code&state=$(session.state)"; retry=false)
+            @test response.status == 200
+            callback = wait_for_authorization_code(session; timeout=5)
+            @test callback.code == "local-code"
+        finally
+            session.listener !== nothing && stop_loopback_listener(session.listener)
+        end
+    end
+end
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(

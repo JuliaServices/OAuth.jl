@@ -163,7 +163,7 @@ function prepare_pkce_session(
     state_value = state === nothing ? random_state() : String(state)
     dest_redirect = redirect_uri === nothing ? config.redirect_uri : redirect_uri
     normalized_path = ensure_slash(listener_path)
-    default_redirect = "http://$(listener_host):$(listener_port)$(normalized_path)"
+    default_redirect = loopback_url(listener_host, listener_port, normalized_path)
     effective_redirect = dest_redirect === nothing ? default_redirect : String(dest_redirect)
     start_loopback = start_listener && urls_equivalent(effective_redirect, default_redirect) && startswith(lowercase(effective_redirect), "http://")
     if !start_loopback
@@ -176,6 +176,9 @@ function prepare_pkce_session(
     if start_loopback
         try
             listener = start_loopback_listener(listener_host, listener_port, normalized_path; verbose=verbose)
+            if listener.port != listener_port
+                effective_redirect = string(HTTP.URI(effective_redirect; port=string(listener.port)))
+            end
         catch err
             throw(OAuthError(:listener_error, "Failed to start loopback listener: $(err)"))
         end
