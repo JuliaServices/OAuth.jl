@@ -3184,6 +3184,8 @@ end
     @test !OAuth.jwk_has_private_material(bare)
 end
 
+include("dpop_replay_tests.jl")
+
 include("trim_compile_tests.jl")
 
 @testset "take_with_timeout does not discard a late redirect" begin

@@ -719,19 +719,23 @@ end
 """
     DPoPReplayCache
 
-Tracks recently seen DPoP JWT IDs so you can reject replays at the token
-endpoint or protected resource.  Thread-safe via a `ReentrantLock`.
+Tracks DPoP JWT IDs for [`protected_resource_middleware`](@ref) until their
+accepted proof lifetimes end. Thread-safe within one process via a
+`ReentrantLock`; separate processes do not share replay state.
 """
 mutable struct DPoPReplayCache
     lock::ReentrantLock
-    entries::Dict{String,DateTime}
+    entries::Dict{String,DateTime} # Internal storage: inclusive expiry times.
     window::Dates.Second
 end
 
 """
     DPoPReplayCache(; window_seconds=300)
 
-Creates a replay cache that expires entries after `window_seconds`.
+Creates a replay cache with a minimum retention of `window_seconds` after
+first acceptance. The protected-resource verifier retains each ID longer when
+needed to cover the proof's accepted lifetime, including future issue times
+allowed by clock skew.
 """
 function DPoPReplayCache(; window_seconds::Integer=300)
     window_seconds > 0 || throw(ArgumentError("window_seconds must be positive"))
@@ -739,24 +743,23 @@ function DPoPReplayCache(; window_seconds::Integer=300)
 end
 
 function cleanup_replay_cache!(cache::DPoPReplayCache, now::DateTime)
-    threshold = now - cache.window
     expired = String[]
-    for (jti, timestamp) in cache.entries
-        timestamp < threshold && push!(expired, jti)
+    for (jti, expires_at) in cache.entries
+        expires_at < now && push!(expired, jti)
     end
     for jti in expired
         delete!(cache.entries, jti)
     end
 end
 
-function record_dpop_proof!(cache::DPoPReplayCache, jti::AbstractString, now::DateTime)
+function record_dpop_proof!(cache::DPoPReplayCache, jti::AbstractString, now::DateTime, proof_expires_at::DateTime=now)
     lock(cache.lock) do
         cleanup_replay_cache!(cache, now)
         key = String(jti)
         if haskey(cache.entries, key)
             return false
         end
-        cache.entries[key] = now
+        cache.entries[key] = max(now + cache.window, proof_expires_at)
         return true
     end
 end
@@ -2583,9 +2586,10 @@ end
 """
     validate_jwt_access_token(token, config; now=Dates.now(UTC), required_scopes=String[]) -> AccessTokenClaims
 
-Checks signature, issuer, audience, expiration, scope, DPoP confirmation,
-and optional replay cache entries for a JWT access token that your server
-received.  Throws `OAuthError` if validation fails.
+Checks a JWT access token's signature, issuer, audience, time limits, and required
+scopes. Returns `AccessTokenClaims`, including any DPoP key thumbprint. DPoP proof
+and replay checks are performed by [`protected_resource_middleware`](@ref).
+Throws `OAuthError` if validation fails.
 """
 function validate_jwt_access_token(token::AbstractString, config::TokenValidationConfig; now::DateTime=Dates.now(UTC), required_scopes=String[])
     header, payload, signature, signing_input = decode_compact_jwt(token)
@@ -2790,7 +2794,7 @@ function verify_dpop_proof(
     end
     jti = get(payload, "jti", nothing)
     jti isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing jti"))
-    record_dpop_proof!(replay_cache, String(jti), now) || throw(OAuthError(:invalid_token, "DPoP proof replay detected"))
+    record_dpop_proof!(replay_cache, String(jti), now, iat + max_age) || throw(OAuthError(:invalid_token, "DPoP proof replay detected"))
 end
 
 """
@@ -2817,11 +2821,13 @@ function unauthorized_response(resource_metadata_url; realm=nothing, required_sc
 end
 
 """
-    protected_resource_middleware(; token_store=nothing, token_validator=nothing, realm=DEFAULT_REALM, extra_challenges=String[])
+    protected_resource_middleware(handler, validator; resource_metadata_url, kwargs...)
 
 Builds an HTTP middleware function that validates incoming `Authorization`
 headers, enforces scope requirements, and passes the resulting
-[`AccessTokenClaims`](@ref) to your handler via the request context.
+[`AccessTokenClaims`](@ref) to your handler via the request context. For DPoP
+tokens, each proof ID is retained through its accepted lifetime and at least
+the retention interval of `dpop_replay_cache`, if supplied.
 """
 function protected_resource_middleware(
     handler::Function,
