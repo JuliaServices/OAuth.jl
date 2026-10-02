@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="Pure Julia implementation of OAuth v1.0a">
+        <meta name="author" content="randyzwitch">
+        
+        <link rel="shortcut icon" href="./img/favicon.ico">
+
+	<title>OAuth.jl</title>
+
+        <link href="./css/bootstrap-custom.min.css" rel="stylesheet">
+        <link href="./css/font-awesome-4.0.3.css" rel="stylesheet">
+        <link rel="stylesheet" href="./css/highlight.css">
+        <link href="./css/base.css" rel="stylesheet">
+        <link href="./assets/Documenter.css" rel="stylesheet">
+
+        <!-- HTML5 shim and Respond.js IE8 support of HTML5 elements and media queries -->
+        <!--[if lt IE 9]>
+            <script src="https://oss.maxcdn.com/libs/html5shiv/3.7.0/html5shiv.js"></script>
+            <script src="https://oss.maxcdn.com/libs/respond.js/1.3.0/respond.min.js"></script>
+        <![endif]-->
+
+        
+    </head>
+
+    <body>
+
+        <div class="navbar navbar-default navbar-fixed-top" role="navigation">
+    <div class="container">
+
+        <!-- Collapsed navigation -->
+        <div class="navbar-header">
+            <!-- Expander button -->
+            <button type="button" class="navbar-toggle" data-toggle="collapse" data-target=".navbar-collapse">
+                <span class="sr-only">Toggle navigation</span>
+                <span class="icon-bar"></span>
+                <span class="icon-bar"></span>
+                <span class="icon-bar"></span>
+            </button>
+
+            <!-- Main title -->
+            <a class="navbar-brand" href=".">OAuth.jl</a>
+        </div>
+
+        <!-- Expanded navigation -->
+        <div class="navbar-collapse collapse">
+            <!-- Main navigation -->
+            <ul class="nav navbar-nav">
+            
+            
+                <li class="active">
+                    <a href=".">Home</a>
+                </li>
+            
+            
+            </ul>
+
+            <!-- Search, Navigation and Repo links -->
+            <ul class="nav navbar-nav navbar-right">
+                <li>
+                    <a href="#" data-toggle="modal" data-target="#mkdocs_search_modal">
+                        <i class="fa fa-search"></i> Search
+                    </a>
+                </li>
+                <li class="disabled">
+                    <a rel="next" >
+                        <i class="fa fa-arrow-left"></i> Previous
+                    </a>
+                </li>
+                <li class="disabled">
+                    <a rel="prev" >
+                        Next <i class="fa fa-arrow-right"></i>
+                    </a>
+                </li>
+                
+                <li>
+                    <a href="https://github.com/randyzwitch/OAuth.jl">
+                        
+                            <i class="fa fa-github"></i>
+                        
+                        GitHub
+                    </a>
+                </li>
+                
+            </ul>
+        </div>
+    </div>
+</div>
+
+        <div class="container">
+            <div class="col-md-3"><div class="bs-sidebar hidden-print affix well" role="complementary">
+    <ul class="nav bs-sidenav">
+    
+        <li class="main active"><a href="#functions">Functions</a></li>
+        
+    
+        <li class="main "><a href="#index">Index</a></li>
+        
+    
+    </ul>
+</div></div>
+            <div class="col-md-9" role="main">
+
+<p>My interpretation of the OAuth 1.0 protocol, based on my reading of <a href="https://tools.ietf.org/html/rfc5849">RFC5849</a>, the <a href="http://liboauth.sourceforge.net/">liboauth</a> C library and factoring out the OAuth authentication code from <a href="https://github.com/randyzwitch/Twitter.jl">Twitter.jl</a>. At one point, this package relied on liboauth and was a wrapper of that library's functions built using <a href="https://github.com/ihnorton/Clang.jl">Clang.jl</a>; however, as I cleaned up the auto-generated functions from Clang, I decided that it would be easier and cleaner to re-write the library in Julia rather than require liboauth.</p>
+<p>This is still a work-in-progress, but works as a replacement for the authentication in the Twitter.jl package, so it should be fairly complete in its implementation.</p>
+<pre><code>- [Functions](index.md#Functions-1)
+- [Index](index.md#Index-1)
+</code></pre>
+<p><a id='Functions-1'></a></p>
+<h2 id="functions">Functions</h2>
+<p><a id='OAuth.encodeURI!-Tuple{Dict}' href='#OAuth.encodeURI!-Tuple{Dict}'>#</a>
+<strong><code>OAuth.encodeURI!</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>encodeURI!(dict_of_parameters::Dict)
+</code></pre>
+
+<p>Mutates dict_of_parameters using <code>encodeURI</code> on strings.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; encodeURI!(Dict(&quot;iv&quot; =&gt; 10, &quot;s&quot; =&gt; &quot;value!&quot;))
+Dict{String,Any} with 2 entries:
+  &quot;iv&quot; =&gt; 10
+  &quot;s&quot;  =&gt; &quot;value%21&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L162-L174' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.encodeURI-Tuple{Any}' href='#OAuth.encodeURI-Tuple{Any}'>#</a>
+<strong><code>OAuth.encodeURI</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>encodeURI(s)
+</code></pre>
+
+<p>Convenience function for <code>HTTP.escape</code>.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; encodeURI(&quot;hello, world!&quot;)
+&quot;hello%2C%20world%21&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L149-L159' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_body_hash_data-Tuple{String}' href='#OAuth.oauth_body_hash_data-Tuple{String}'>#</a>
+<strong><code>OAuth.oauth_body_hash_data</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_body_hash_data(data::String)
+</code></pre>
+
+<p>Returns <code>oauth_body_hash=</code> along with base64 encoded SHA-1 from input.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_body_hash_data(&quot;Hello, World!&quot;)
+&quot;oauth_body_hash=CgqfKmdylCVXq1NV12r0Qvj2XgE=&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L204-L214' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_body_hash_encode-Tuple{String}' href='#OAuth.oauth_body_hash_encode-Tuple{String}'>#</a>
+<strong><code>OAuth.oauth_body_hash_encode</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_body_hash_encode(data::String)
+</code></pre>
+
+<p>Convenience function for SHA-1 and base64 encoding.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_body_hash_encode(&quot;julialang&quot;)
+&quot;Lsztg2byou89Y8lBoH3G8v3vjbw=&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L219-L229' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_body_hash_file-Tuple{String}' href='#OAuth.oauth_body_hash_file-Tuple{String}'>#</a>
+<strong><code>OAuth.oauth_body_hash_file</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_body_hash_file(filename::String)
+</code></pre>
+
+<p>Returns <code>oauth_body_hash=</code> along with base64 encoded SHA-1 from input text file.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_body_hash_file(joinpath(Pkg.dir(), &quot;OAuth/test/auth_body_hash_file.txt&quot;))
+&quot;oauth_body_hash=CgqfKmdylCVXq1NV12r0Qvj2XgE=&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L189-L199' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_header-NTuple{7,Any}' href='#OAuth.oauth_header-NTuple{7,Any}'>#</a>
+<strong><code>OAuth.oauth_header</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>function oauth_header(httpmethod, baseurl, options, oauth_consumer_key, oauth_consumer_secret, oauth_token, oauth_token_secret; oauth_signature_method = &quot;HMAC-SHA1&quot;, oauth_version = &quot;1.0&quot;)
+</code></pre>
+
+<p>Builds OAuth header, defaulting to OAuth 1.0. Function assumes <code>options</code> has already been run through <code>encodeURI!</code>.</p>
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L234-L240' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_nonce-Tuple{Int64}' href='#OAuth.oauth_nonce-Tuple{Int64}'>#</a>
+<strong><code>OAuth.oauth_nonce</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_nonce(length::Int)
+</code></pre>
+
+<p>Returns a random string of a given length.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_nonce(10)
+&quot;aQb2FVkrYi&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L37-L47' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_percent_encode_keys!-Tuple{Dict}' href='#OAuth.oauth_percent_encode_keys!-Tuple{Dict}'>#</a>
+<strong><code>OAuth.oauth_percent_encode_keys!</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_percent_encode_keys!(options::Dict)
+</code></pre>
+
+<p>Returns dict where keys and values are URL-encoded.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_percent_encode_keys!(Dict(&quot;key 1&quot; =&gt; &quot;value1&quot;, &quot;key    2&quot; =&gt; &quot;value 2&quot;))
+Dict{String,String} with 2 entries:
+  &quot;key%20%20%20%202&quot; =&gt; &quot;value%202&quot;
+  &quot;key%201&quot;          =&gt; &quot;value1&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L97-L109' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_request_resource-Tuple{String,String,Dict,String,String,String,String}' href='#OAuth.oauth_request_resource-Tuple{String,String,Dict,String,String,String,String}'>#</a>
+<strong><code>OAuth.oauth_request_resource</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_request_resource(endpoint::String, httpmethod::String, options::Dict, oauth_consumer_key::String, oauth_consumer_secret::String, oauth_token::String, oauth_token_secret::String)
+</code></pre>
+
+<p>Makes <code>GET</code> or <code>POST</code> call to OAuth API.</p>
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L270-L275' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_serialize_url_parameters-Tuple{Dict}' href='#OAuth.oauth_serialize_url_parameters-Tuple{Dict}'>#</a>
+<strong><code>OAuth.oauth_serialize_url_parameters</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_serialize_url_parameters(options::Dict)
+</code></pre>
+
+<p>Returns query string by concatenating dictionary keys/values.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_serialize_url_parameters(Dict(&quot;foo&quot; =&gt; &quot;bar&quot;, &quot;foo 1&quot; =&gt; &quot;hello!&quot;))
+&quot;foo=bar&amp;foo 1=hello!&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L132-L142' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_sign_hmac_sha1-Tuple{String,String}' href='#OAuth.oauth_sign_hmac_sha1-Tuple{String,String}'>#</a>
+<strong><code>OAuth.oauth_sign_hmac_sha1</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_sign_hmac_sha1(message::String, signingkey::String)
+</code></pre>
+
+<p>Takes a message and signing key, converts to a SHA-1 digest, then encodes to base64.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_sign_hmac_sha1(&quot;foo&quot;, &quot;bar&quot;)
+&quot;hdFVxV7ShqMAvRzxJN4I2H6RTzo=&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L52-L62' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_signature_base_string-Tuple{String,String,String}' href='#OAuth.oauth_signature_base_string-Tuple{String,String,String}'>#</a>
+<strong><code>OAuth.oauth_signature_base_string</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_signature_base_string(httpmethod::String, url::String, parameterstring::String)
+</code></pre>
+
+<p>Returns encoded HTTP method, url and parameters.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_signature_base_string(&quot;POST&quot;, &quot;https://julialang.org&quot;, &quot;foo&amp;bar&quot;)
+&quot;POST&amp;https%3A%2F%2Fjulialang.org&amp;foo%26bar&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L82-L92' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_signing_key-Tuple{String,String}' href='#OAuth.oauth_signing_key-Tuple{String,String}'>#</a>
+<strong><code>OAuth.oauth_signing_key</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_signing_key(oauth_consumer_secret::String, oauth_token_secret::String)
+</code></pre>
+
+<p>Returns a signing key based on a consumer secret and token secret.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_signing_key(&quot;foo&quot;, &quot;bar&quot;)
+&quot;foo&amp;bar&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L67-L77' class='documenter-source'>source</a><br></p>
+<p><a id='OAuth.oauth_timestamp-Tuple{}' href='#OAuth.oauth_timestamp-Tuple{}'>#</a>
+<strong><code>OAuth.oauth_timestamp</code></strong> &mdash; <em>Method</em>.</p>
+<pre><code>oauth_timestamp()
+</code></pre>
+
+<p>Returns current unix timestamp as String.</p>
+<p><strong>Examples</strong></p>
+<pre><code class="julia-repl">julia&gt; oauth_timestamp()
+&quot;1512235859&quot;
+</code></pre>
+
+<p><a target='_blank' href='https://github.com/randyzwitch/OAuth.jl/blob/bdfe2c9d0bd14b1bb70a7691d2238523cae7de2e/src/OAuth.jl#L22-L32' class='documenter-source'>source</a><br></p>
+<p><a id='Index-1'></a></p>
+<h2 id="index">Index</h2>
+<ul>
+<li><a href=".#OAuth.encodeURI-Tuple{Any}"><code>OAuth.encodeURI</code></a></li>
+<li><a href=".#OAuth.encodeURI!-Tuple{Dict}"><code>OAuth.encodeURI!</code></a></li>
+<li><a href=".#OAuth.oauth_body_hash_data-Tuple{String}"><code>OAuth.oauth_body_hash_data</code></a></li>
+<li><a href=".#OAuth.oauth_body_hash_encode-Tuple{String}"><code>OAuth.oauth_body_hash_encode</code></a></li>
+<li><a href=".#OAuth.oauth_body_hash_file-Tuple{String}"><code>OAuth.oauth_body_hash_file</code></a></li>
+<li><a href=".#OAuth.oauth_header-NTuple{7,Any}"><code>OAuth.oauth_header</code></a></li>
+<li><a href=".#OAuth.oauth_nonce-Tuple{Int64}"><code>OAuth.oauth_nonce</code></a></li>
+<li><a href=".#OAuth.oauth_percent_encode_keys!-Tuple{Dict}"><code>OAuth.oauth_percent_encode_keys!</code></a></li>
+<li><a href=".#OAuth.oauth_request_resource-Tuple{String,String,Dict,String,String,String,String}"><code>OAuth.oauth_request_resource</code></a></li>
+<li><a href=".#OAuth.oauth_serialize_url_parameters-Tuple{Dict}"><code>OAuth.oauth_serialize_url_parameters</code></a></li>
+<li><a href=".#OAuth.oauth_sign_hmac_sha1-Tuple{String,String}"><code>OAuth.oauth_sign_hmac_sha1</code></a></li>
+<li><a href=".#OAuth.oauth_signature_base_string-Tuple{String,String,String}"><code>OAuth.oauth_signature_base_string</code></a></li>
+<li><a href=".#OAuth.oauth_signing_key-Tuple{String,String}"><code>OAuth.oauth_signing_key</code></a></li>
+<li><a href=".#OAuth.oauth_timestamp-Tuple{}"><code>OAuth.oauth_timestamp</code></a></li>
+</ul></div>
+        </div>
+
+        <footer class="col-md-12">
+            <hr>
+            
+            <center>Documentation built with <a href="http://www.mkdocs.org/">MkDocs</a>.</center>
+        </footer>
+
+        <script src="./js/jquery-1.10.2.min.js"></script>
+        <script src="./js/bootstrap-3.0.3.min.js"></script>
+        <script src="./js/highlight.pack.js"></script>
+        <script>var base_url = '.';</script>
+        <script data-main="./mkdocs/js/search.js" src="./mkdocs/js/require.js"></script>
+        <script src="./js/base.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-AMS_HTML"></script>
+        <script src="./assets/mathjaxhelper.js"></script>
+
+        <div class="modal" id="mkdocs_search_modal" tabindex="-1" role="dialog" aria-labelledby="Search Modal" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <button type="button" class="close" data-dismiss="modal"><span aria-hidden="true">&times;</span><span class="sr-only">Close</span></button>
+                        <h4 class="modal-title" id="exampleModalLabel">Search</h4>
+                    </div>
+                    <div class="modal-body">
+                        <p>
+                            From here you can search these documents. Enter
+                            your search terms below.
+                        </p>
+                        <form role="form">
+                            <div class="form-group">
+                                <input type="text" class="form-control" placeholder="Search..." id="mkdocs-search-query">
+                            </div>
+                        </form>
+                        <div id="mkdocs-search-results"></div>
+                    </div>
+                    <div class="modal-footer">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </body>
+</html>
