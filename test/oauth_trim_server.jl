@@ -260,9 +260,23 @@ function run_oauth_trim_server()::Nothing
     return nothing
 end
 
+function _trim_dpop_replay_cache(args::Vector{String})
+    offset = isempty(args) ? 301 : parse(Int, args[1])
+    _trim_server_assert(offset >= 0, "nonnegative replay time")
+    now = OAuth.Dates.DateTime(2026, 9, 26)
+    cache = OAuth.DPoPReplayCache()
+    _trim_server_assert(
+        OAuth.record_dpop_proof!(cache, "proof", now, now + OAuth.Dates.Second(360)),
+        "first DPoP proof",
+    )
+    accepted = OAuth.record_dpop_proof!(cache, "proof", now + OAuth.Dates.Second(offset))
+    _trim_server_assert(accepted == (offset > 360), "inclusive DPoP replay expiry")
+    return nothing
+end
+
 function @main(args::Vector{String})::Cint
-    _ = args
     run_oauth_trim_server()
+    _trim_dpop_replay_cache(args)
     return 0
 end
 

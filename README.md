@@ -516,6 +516,13 @@ HTTP.register!(router, "GET", "/payments", secured_handler)
 
 When the incoming token is sender constrained, OAuth.jl verifies the accompanying DPoP proof (htu/htm/ath), enforces nonce policies, and rejects replayed JTIs via `DPoPReplayCache`.
 
+Replay records remain until the proof's accepted lifetime ends, including any
+allowed future issue time. A supplied `OAuth.DPoPReplayCache(window_seconds=...)`
+sets a minimum retention interval; IDs remain tracked for a longer proof
+lifetime even when the cache interval is shorter. The cache is shared only
+within its process. Deployments with multiple processes must coordinate replay
+protection separately.
+
 ### Authorization Endpoint Helpers
 
 `build_authorization_endpoint` wires together redirect validation, consent collection, PKCE enforcement, and authorization-code issuance. You implement two small callbacks: a redirect resolver and a consent handler that returns `AuthorizationGrantDecision`.

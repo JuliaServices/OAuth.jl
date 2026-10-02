@@ -18,6 +18,10 @@ delete_dynamic_client
 JWTAccessTokenIssuer
 issue_access_token
 public_jwk
+AccessTokenClaims
+validate_jwt_access_token
+DPoPReplayCache
+protected_resource_middleware
 register_jwks_endpoint!
 AccessTokenStore
 AccessTokenRecord
