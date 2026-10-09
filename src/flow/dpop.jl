@@ -1,18 +1,18 @@
  
 
 function requires_dpop_nonce_retry(resp::HTTP.Response)
-    www_authenticate = header_value(resp.headers, "WWW-Authenticate", "")
-    isempty(www_authenticate) && return false
-    try
-        challenges = parse_www_authenticate(www_authenticate)
-        for challenge in challenges
-            err = get(challenge.params, "error", nothing)
-            if err !== nothing && lowercase(String(err)) == "use_dpop_nonce"
-                return true
+    for (name, www_authenticate) in resp.headers
+        ascii_lc_isequal(name, "WWW-Authenticate") || continue
+        try
+            for challenge in parse_www_authenticate(www_authenticate)
+                err = get(challenge.params, "error", nothing)
+                if err !== nothing && lowercase(String(err)) == "use_dpop_nonce"
+                    return true
+                end
             end
+        catch
+            occursin("use_dpop_nonce", lowercase(String(www_authenticate))) && return true
         end
-    catch
-        return occursin("use_dpop_nonce", lowercase(String(www_authenticate)))
     end
     return false
 end
