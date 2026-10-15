@@ -2388,11 +2388,15 @@ function VerificationKey(; kid=nothing, alg=nothing, use=nothing, kty, verifier)
 end
 
 """
-    TokenValidationConfig
+    TokenValidationConfig(; issuer, audience, jwks,
+                          allowed_algs=(:RS256, :PS256, :ES256, :ES384, :EDDSA),
+                          leeway_seconds=60)
 
-Holds the knobs for JWT access token validation: a set of trusted issuers,
-expected audience, acceptable algorithms, leeway, DPoP replay cache, etc.
-Feed it to [`validate_jwt_access_token`](@ref).
+Settings for [`validate_jwt_access_token`](@ref): the expected `issuer`, the
+accepted `audience` values (a token must name at least one; an empty list skips
+the check), the issuer's signing keys as a JWKS, the accepted signing
+algorithms, and the allowed clock skew in seconds. DPoP replay protection is
+configured on [`protected_resource_middleware`](@ref) instead.
 """
 struct TokenValidationConfig
     issuer::String
