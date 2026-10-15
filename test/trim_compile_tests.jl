@@ -4,7 +4,8 @@ const _TRIM_SAFE_ERROR_BUDGET = 0
 const _TRIM_SUPPORTED = VERSION >= v"1.12.0-rc1"
 const _TRIM_PRE_RELEASE = !isempty(VERSION.prerelease)
 const _TRIM_SETUP_TIMEOUT_S = Sys.iswindows() ? 600.0 : 120.0
-const _TRIM_COMPILE_TIMEOUT_S = Sys.iswindows() ? 600.0 : 120.0
+# oauth_trim_safe.jl alone takes 100-170 s on GitHub runners (Julia 1.13)
+const _TRIM_COMPILE_TIMEOUT_S = 600.0
 const _TRIM_EXECUTABLE_TIMEOUT_S = Sys.iswindows() ? 120.0 : 30.0
 const _TRIM_USE_BUNDLE = Sys.iswindows()
 const _JULIAC_ENTRYPOINT_EXPR = "using JuliaC; if isdefined(JuliaC, :main); JuliaC.main(ARGS); else JuliaC._main_cli(ARGS); end"
