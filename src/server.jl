@@ -2599,8 +2599,8 @@ function validate_jwt_access_token(token::AbstractString, config::TokenValidatio
     header, payload, signature, signing_input = decode_compact_jwt(token)
     haskey(header, "alg") || throw(OAuthError(:invalid_token, "Missing alg"))
     header["alg"] isa AbstractString || throw(OAuthError(:invalid_token, "alg header must be a string"))
-    alg = Symbol(uppercase(String(header["alg"])))
-    alg in config.allowed_algs || throw(OAuthError(:invalid_token, "Disallowed alg $(alg)"))
+    alg = find_alg(header["alg"], config.allowed_algs)
+    alg === nothing && throw(OAuthError(:invalid_token, "Disallowed alg $(header["alg"])"))
     kid = (haskey(header, "kid") && header["kid"] isa AbstractString) ? String(header["kid"]) : nothing
     key = select_verification_key(config, alg, kid)
     verify_jws(key.verifier, alg, signing_input, signature) || throw(OAuthError(:invalid_token, "JWT signature invalid"))
@@ -2699,6 +2699,9 @@ function normalized_request_url(req::HTTP.Request, origin::ResourceOrigin)
     return normalize_dpop_url(absolute)
 end
 
+# DPoP proofs are verified with the EC or RSA key they carry
+const DPOP_PROOF_ALGS = union(SUPPORTED_EC_ALGS, SUPPORTED_RSA_ALGS)
+
 function build_dpop_verifier_from_jwk(jwk::Dict{String,Any}, alg::Symbol)
     kty_value = get(jwk, "kty", nothing)
     kty_value isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof missing key type"))
@@ -2765,7 +2768,8 @@ function verify_dpop_proof(
     jwk_has_private_material(jwk) && throw(OAuthError(:invalid_token, "DPoP proof jwk must not contain private key material"))
     alg_header = get(header, "alg", nothing)
     alg_header isa AbstractString || throw(OAuthError(:invalid_token, "DPoP proof alg must be a string"))
-    alg_value = Symbol(uppercase(String(alg_header)))
+    alg_value = find_alg(alg_header, DPOP_PROOF_ALGS)
+    alg_value === nothing && throw(OAuthError(:invalid_token, "Unsupported DPoP alg $(alg_header)"))
     verifier = build_dpop_verifier_from_jwk(jwk, alg_value)
     verify_jws(verifier, alg_value, signing_input, signature) || throw(OAuthError(:invalid_token, "Invalid DPoP proof signature"))
     thumbprint = try

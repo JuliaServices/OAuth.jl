@@ -97,6 +97,17 @@ signer_supports_alg(::EdDSASigner, alg::Symbol) = alg in SUPPORTED_OKP_ALGS
 # OAuth normalizes algorithm symbols to uppercase; JWTs speaks RFC 7518 names.
 jose_alg_name(alg::Symbol) = alg === :EDDSA ? "EdDSA" : String(alg)
 
+# The algorithm in `algs` that a JOSE header's `alg` names (ignoring case), or
+# `nothing`. Header values come from whoever sent the token, so they are never
+# turned into Symbols: Symbols are never freed.
+function find_alg(name::AbstractString, algs)
+    upper = uppercase(name)
+    for alg in algs
+        String(alg) == upper && return alg
+    end
+    return nothing
+end
+
 jose_curve_name(curve::Symbol) =
     curve === :P256 ? "P-256" :
     curve === :P384 ? "P-384" :
