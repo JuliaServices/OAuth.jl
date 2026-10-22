@@ -1985,6 +1985,16 @@ end
     @test req_dpop.context[:dpop]
     replay_resp = dpop_middleware(req_dpop)
     @test replay_resp.status == 401
+    # a proof naming an unknown alg is rejected without creating a Symbol
+    interned(s) = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), s) != C_NULL
+    unknown_alg = "X" * uppercase(string(rand(UInt128); base=36))
+    proof_parts = split(proof, '.')
+    proof_header = JSON.parse(String(OAuth.base64urldecode(String(proof_parts[1]))))
+    proof_header["alg"] = unknown_alg
+    forged = join([OAuth.base64urlencode(JSON.json(proof_header)), proof_parts[2], proof_parts[3]], '.')
+    forged_req = HTTP.Request("GET", "/resource", ["Authorization" => "DPoP $(dpop_token.token)", "DPoP" => forged], "")
+    @test dpop_middleware(forged_req).status == 401
+    @test !interned(unknown_alg)
     constrained_only = protected_resource_middleware(
         _ -> HTTP.Response(200, "ok"),
         validator;
@@ -2213,6 +2223,12 @@ end
     for token in bad_tokens
         @test_throws OAuthError validate_jwt_access_token(token, validator)
     end
+    # an unknown alg is rejected without creating a Symbol (Symbols are never freed)
+    interned(s) = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), s) != C_NULL
+    unknown_alg = "X" * uppercase(string(rand(UInt128); base=36))
+    @test_throws OAuthError validate_jwt_access_token(
+        "$(seg(JSON.json(Dict("alg" => unknown_alg)))).$(seg(JSON.json(Dict()))).AAAA", validator)
+    @test !interned(unknown_alg)
 
     # the middleware must convert all of these into 401 responses
     middleware = OAuth.protected_resource_middleware(
