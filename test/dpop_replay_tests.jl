@@ -132,6 +132,39 @@ using OAuth: HTTP
         @test result(cache, proof, start + Second(301)) == "DPoP proof replay detected"
     end
 
+    @testset "expiry scans are amortized and keep replay decisions" begin
+        # recording a proof does not scan the cache: expired IDs stay until the next prune
+        cache = OAuth.DPoPReplayCache(window_seconds=1)
+        for i in 1:100
+            @test OAuth.record_dpop_proof!(cache, "old-$i", start)
+        end
+        @test OAuth.record_dpop_proof!(cache, "new", start + Second(10))
+        @test length(cache.entries) == 101
+        @test OAuth.record_dpop_proof!(cache, "old-1", start + Second(10))  # expired IDs do not count
+
+        # decisions match a cache that scans on every proof (the earlier behavior)
+        reference = Dict{String,DateTime}()
+        cache = OAuth.DPoPReplayCache(window_seconds=30)
+        t = start
+        mismatches = accepted = maxlen = maxlive = 0
+        for i in 1:10 * OAuth.DPOP_REPLAY_PRUNE_MIN
+            t += Millisecond((i * 7919) % 41)
+            jti = "id-$(i % 1500)"
+            expires_at = t + Second(i % 50)
+            filter!(p -> p.second >= t, reference)
+            expected = !haskey(reference, jti)
+            expected && (reference[jti] = max(t + Second(30), expires_at))
+            got = OAuth.record_dpop_proof!(cache, jti, t, expires_at)
+            mismatches += got != expected
+            accepted += got
+            maxlen = max(maxlen, length(cache.entries))
+            maxlive = max(maxlive, length(reference))
+        end
+        @test mismatches == 0
+        @test 0 < accepted < 10 * OAuth.DPOP_REPLAY_PRUNE_MIN  # both outcomes occurred
+        @test maxlen <= max(2 * maxlive, OAuth.DPOP_REPLAY_PRUNE_MIN)
+    end
+
     @testset "cache-wide IDs retain their existing key scope" begin
         other_jwk = OAuth.public_jwk(issuer)
         other_token = OAuth.issue_access_token(issuer; subject="other-fixture-user",
