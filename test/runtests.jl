@@ -1557,6 +1557,36 @@ warmup_http_client()
     end
 end
 
+@testset "Loopback listener waits for the matching state" begin
+    issuer = "https://id.loopback.example"
+    metadata = Dict(
+        "issuer" => issuer,
+        "authorization_endpoint" => "$(issuer)/authorize",
+        "token_endpoint" => "$(issuer)/token",
+        "code_challenge_methods_supported" => ["S256"],
+    )
+    mock_http = (get = (url; kwargs...) -> HTTP.Response(200, JSON.json(metadata)),)
+    config = PublicClientConfig(client_id="loopback-client")
+    session = start_pkce_authorization_from_issuer(issuer, config;
+        http=mock_http, open_browser=false, listener_port=0)
+    url = OAuth.loopback_url(session.listener)
+    callback(query) = HTTP.get("$(url)?$(query)"; retry=false, status_exception=false).status
+    try
+        # requests that do not carry this flow's state are refused without ending the flow
+        @test callback("") == 400
+        @test callback("code=forged&state=other") == 400
+        # concurrent copies of the real redirect neither block nor replace the first
+        gets = [Threads.@spawn(callback("code=real&state=$(session.state)")) for _ in 1:8]
+        @test timedwait(() -> all(istaskdone, gets), 30) == :ok
+        @test all(t -> istaskdone(t) && fetch(t) == 200, gets)
+        result = wait_for_authorization_code(session; timeout=5)
+        @test result.code == "real"
+    finally
+        stopper = @async stop_loopback_listener(session.listener)
+        @test timedwait(() -> istaskdone(stopper), 30) == :ok
+    end
+end
+
 @testset "Loopback listener flow" begin
     prm_doc = Dict("authorization_servers" => ["https://id.example.org"])
     oas_doc = Dict(

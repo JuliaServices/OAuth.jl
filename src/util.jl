@@ -492,10 +492,19 @@ function urls_equivalent(a::AbstractString, b::AbstractString)
     end
 end
 
-function start_loopback_listener(host::AbstractString, port::Integer, path::AbstractString; verbose::Bool=false)
+"""
+    start_loopback_listener(host, port, path; state=nothing, verbose=false) -> LoopbackListener
+
+Serve `GET path` on `host:port` and deliver the query parameters of the first
+callback request to the listener's `result_channel`. With `state`, only a
+request carrying that `state` parameter counts; any other request gets a 400
+page and the listener keeps waiting, so a stray request cannot end the flow.
+"""
+function start_loopback_listener(host::AbstractString, port::Integer, path::AbstractString; state::Union{AbstractString,Nothing}=nothing, verbose::Bool=false)
     channel = Channel{StringParams}(1)
     router = HTTP.Router()
     normalized_path = ensure_slash(path)
+    expected_state = state === nothing ? nothing : String(state)
     handler = function(req)
         uri = HTTP.URI(req.target)
         query = HTTP.URIs.queryparams(uri)
@@ -503,8 +512,21 @@ function start_loopback_listener(host::AbstractString, port::Integer, path::Abst
         for (k, v) in query
             params[String(k)] = String(v)
         end
-        if !isready(channel)
-            put!(channel, params)
+        if expected_state !== nothing && get(params, "state", nothing) != expected_state
+            return HTTP.Response(400, ["Content-Type" => "text/html"], """
+            <html>
+                <head><title>Authentication Not Recognized</title></head>
+                <body>
+                    <h1>Authentication response not recognized</h1>
+                    <p>This response does not belong to the pending sign-in. Return to your application.</p>
+                </body>
+            </html>
+            """)
+        end
+        # check-and-put under the channel lock: a concurrent duplicate can neither
+        # replace the first callback nor block on the full channel
+        lock(channel) do
+            isready(channel) || put!(channel, params)
         end
         body = """
         <html>
