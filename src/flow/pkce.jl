@@ -175,7 +175,7 @@ function prepare_pkce_session(
     listener = nothing
     if start_loopback
         try
-            listener = start_loopback_listener(listener_host, listener_port, normalized_path; verbose=verbose)
+            listener = start_loopback_listener(listener_host, listener_port, normalized_path; state=state_value, verbose=verbose)
             if listener.port != listener_port
                 effective_redirect = string(HTTP.URI(effective_redirect; port=string(listener.port)))
             end
