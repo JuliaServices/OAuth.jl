@@ -727,7 +727,12 @@ mutable struct DPoPReplayCache
     lock::ReentrantLock
     entries::Dict{String,DateTime} # Internal storage: inclusive expiry times.
     window::Dates.Second
+    prune_at::Int # entry count at which the next expiry scan runs
 end
+
+# Expired IDs are scanned out once the cache doubles (and holds at least this many),
+# so each recorded proof costs O(1) amortized instead of a scan of every stored ID.
+const DPOP_REPLAY_PRUNE_MIN = 1024
 
 """
     DPoPReplayCache(; window_seconds=300)
@@ -739,7 +744,7 @@ allowed by clock skew.
 """
 function DPoPReplayCache(; window_seconds::Integer=300)
     window_seconds > 0 || throw(ArgumentError("window_seconds must be positive"))
-    return DPoPReplayCache(ReentrantLock(), Dict{String,DateTime}(), Dates.Second(window_seconds))
+    return DPoPReplayCache(ReentrantLock(), Dict{String,DateTime}(), Dates.Second(window_seconds), DPOP_REPLAY_PRUNE_MIN)
 end
 
 function cleanup_replay_cache!(cache::DPoPReplayCache, now::DateTime)
@@ -754,10 +759,13 @@ end
 
 function record_dpop_proof!(cache::DPoPReplayCache, jti::AbstractString, now::DateTime, proof_expires_at::DateTime=now)
     lock(cache.lock) do
-        cleanup_replay_cache!(cache, now)
         key = String(jti)
-        if haskey(cache.entries, key)
-            return false
+        # an entry past its expiry no longer counts, whether or not a scan removed it yet
+        expires_at = get(cache.entries, key, nothing)
+        expires_at !== nothing && expires_at >= now && return false
+        if length(cache.entries) >= cache.prune_at
+            cleanup_replay_cache!(cache, now)
+            cache.prune_at = max(2 * length(cache.entries), DPOP_REPLAY_PRUNE_MIN)
         end
         cache.entries[key] = max(now + cache.window, proof_expires_at)
         return true
