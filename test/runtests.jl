@@ -1101,6 +1101,62 @@ end
     @test OAuth.load_refresh_token(config2) === nothing
 end
 
+@testset "Concurrent refreshes through one store redeem the token once" begin
+    auth_meta = AuthorizationServerMetadata(JSON.parse(JSON.json(Dict(
+        "issuer" => "https://id.refresh", "token_endpoint" => "https://id.refresh/token"))))
+    # token endpoint that rotates refresh tokens and revokes the session when a used one comes back
+    function rotating_server()
+        lk = ReentrantLock()
+        state = (current = Ref("rt1"), gen = Ref(1), posts = Ref(0))
+        post = (url; headers=nothing, body="", kwargs...) -> begin
+            sleep(0.1)
+            form = Dict{String,String}(HTTP.URIs.queryparams(HTTP.URI("?" * body)))
+            lock(lk) do
+                state.posts[] += 1
+                if form["refresh_token"] == state.current[]
+                    state.gen[] += 1
+                    state.current[] = "rt$(state.gen[])"
+                    return HTTP.Response(200, JSON.json(Dict("access_token" => "at$(state.gen[])", "token_type" => "Bearer",
+                        "expires_in" => 3600, "refresh_token" => state.current[])))
+                end
+                state.current[] = "revoked"
+                return HTTP.Response(400, JSON.json(Dict("error" => "invalid_grant")))
+            end
+        end
+        return (post = post,), state
+    end
+    mktempdir() do dir
+        held = Ref{Union{Nothing,String}}(nothing)
+        stores = [
+            InMemoryRefreshTokenStore(),
+            CallbackRefreshTokenStore(load = _ -> held[], save = (_, t) -> (held[] = t), clear = _ -> (held[] = nothing)),
+            FileBasedRefreshTokenStore(joinpath(dir, "token.json"); permissions=nothing),
+        ]
+        for store in stores
+            config = PublicClientConfig(client_id="c", redirect_uri="https://app.example/cb", refresh_token_store=store)
+            OAuth.save_refresh_token!(config, "rt1")
+            http, server = rotating_server()
+            tasks = [Threads.@spawn OAuth.refresh_pkce_token(auth_meta, config; http) for _ in 1:8]
+            outcomes = [try fetch(t).access_token catch e; e end for t in tasks]
+            @test server.posts[] == 1
+            @test outcomes == fill("at2", 8)
+            @test OAuth.load_refresh_token(config) == "rt2"
+            @test server.current[] == "rt2"
+            # a caller that starts after that refresh finished makes its own request
+            @test OAuth.refresh_pkce_token(auth_meta, config; http).access_token == "at3"
+            @test server.posts[] == 2
+            # a rejected stale token leaves the newer stored token in place
+            err = try
+                OAuth.refresh_pkce_token(auth_meta, config; http, refresh_token="rt1")
+            catch e
+                e
+            end
+            @test err isa OAuthError && err.code == :invalid_grant
+            @test OAuth.load_refresh_token(config) == "rt3"
+        end
+    end
+end
+
 @testset "load_or_refresh_token file-store locking" begin
     mktempdir() do dir
         path = joinpath(dir, "token.json")

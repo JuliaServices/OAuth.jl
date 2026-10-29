@@ -8,8 +8,30 @@ Concrete stores implement three simple methods—`load_refresh_token`,
 `save_refresh_token!`, and `clear_refresh_token!`—so that the higher-level
 PKCE helpers can securely remember long-lived refresh tokens without you
 writing boilerplate.
+
+With the built-in stores, concurrent `refresh_pkce_token` calls that
+use the stored token redeem it once; custom stores get no such coordination.
 """
 abstract type RefreshTokenStore end
+
+"""
+    RefreshFlight()
+
+Per-store state that lets concurrent refreshes redeem the stored refresh token once.
+One refresh runs at a time; a caller that waited while a refresh with the same
+request finished gets that refresh's token or error instead of redeeming again.
+"""
+mutable struct RefreshFlight
+    const lock::ReentrantLock
+    @atomic finished::Int
+    request::String   # endpoint, form fields (without the refresh token), and DPoP key of the last finished refresh
+    outcome::Any      # its TokenResponse, or the exception it threw
+    failed::Bool
+end
+
+RefreshFlight() = RefreshFlight(ReentrantLock(), 0, "", nothing, false)
+# the outcome holds live tokens, so printing a store must not show it
+Base.show(io::IO, ::RefreshFlight) = print(io, "OAuth.RefreshFlight()")
 
 """
     InMemoryRefreshTokenStore()
@@ -28,8 +50,10 @@ julia> load_refresh_token(store, cfg)
 """
 struct InMemoryRefreshTokenStore <: RefreshTokenStore
     token::Base.RefValue{Union{Nothing,String}}
+    flight::RefreshFlight
 end
 
+InMemoryRefreshTokenStore(token) = InMemoryRefreshTokenStore(token, RefreshFlight())
 InMemoryRefreshTokenStore() = InMemoryRefreshTokenStore(Base.RefValue{Union{Nothing,String}}(nothing))
 
 """
@@ -44,7 +68,11 @@ struct FileBasedRefreshTokenStore <: RefreshTokenStore
     permissions::Union{Nothing,UInt}
     lock_path::String
     lock_stale_age::Float64
+    flight::RefreshFlight
 end
+
+FileBasedRefreshTokenStore(path, permissions, lock_path, lock_stale_age) =
+    FileBasedRefreshTokenStore(path, permissions, lock_path, lock_stale_age, RefreshFlight())
 
 const DEFAULT_REFRESH_TOKEN_LOCK_STALE_AGE = 30.0
 
@@ -187,7 +215,11 @@ struct CallbackRefreshTokenStore{L,S,C} <: RefreshTokenStore
     load_callback::L
     save_callback::S
     clear_callback::C
+    flight::RefreshFlight
 end
+
+CallbackRefreshTokenStore(load::L, save::S, clear::C) where {L,S,C} =
+    CallbackRefreshTokenStore{L,S,C}(load, save, clear, RefreshFlight())
 
 """
     CallbackRefreshTokenStore(; load, save, clear=nothing)
@@ -828,6 +860,39 @@ function clear_refresh_token!(store::CallbackRefreshTokenStore, config::PublicCl
     store.clear_callback(config)
 end
 
+refresh_flight(::Union{RefreshTokenStore,Nothing}) = nothing
+refresh_flight(store::Union{InMemoryRefreshTokenStore,FileBasedRefreshTokenStore,CallbackRefreshTokenStore}) = store.flight
+
+# Clears the store only while it still holds `rejected`, so a rejected stale token never
+# wipes the newer one a concurrent refresh saved. The flight lock orders this after any
+# refresh in progress through the same store.
+function clear_rejected_refresh_token!(config::PublicClientConfig, rejected::String)
+    store = config.refresh_token_store
+    flight = refresh_flight(store)
+    flight === nothing && return clear_rejected_refresh_token!(store, config, rejected)
+    return lock(() -> clear_rejected_refresh_token!(store, config, rejected), flight.lock)
+end
+
+function clear_rejected_refresh_token!(store::Union{RefreshTokenStore,Nothing}, config::PublicClientConfig, rejected::String)
+    load_refresh_token(store, config) == rejected && clear_refresh_token!(store, config)
+    return
+end
+
+function clear_rejected_refresh_token!(store::FileBasedRefreshTokenStore, config::PublicClientConfig, rejected::String)
+    verbose = config_verbose(config)
+    return with_refresh_token_lock(store, verbose) do
+        ispath(store.path) || return
+        stored = try
+            decode_token_document(read(store.path, String))
+        catch err
+            verbose && @warn "Failed to read refresh token file" path=store.path err=err
+            return
+        end
+        stored !== nothing && stored.refresh_token == rejected && clear_token_response_locked!(store, verbose)
+        return
+    end
+end
+
 """
     load_refresh_token(config::PublicClientConfig) -> Union{String,Nothing}
 
@@ -866,8 +931,8 @@ end
     clear_refresh_token!(config::PublicClientConfig)
 
 Asks the underlying store to forget whatever refresh token it currently
-knows about.  Called automatically when a refresh attempt yields
-`invalid_grant`.
+knows about.  The refresh helpers clear the store themselves when the token
+endpoint rejects the token the store still holds with `invalid_grant`.
 """
 function clear_refresh_token!(config::PublicClientConfig)
     clear_refresh_token!(config.refresh_token_store, config)
