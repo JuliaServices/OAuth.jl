@@ -48,6 +48,8 @@ struct AuthorizationCredentials
     token::String
 end
 
+Base.show(io::IO, x::AuthorizationCredentials) = show_redacted(io, x, (:scheme,))
+
 function authorization_credentials(req::HTTP.Request)
     auth = strip(header_value(req.headers, "Authorization", ""))
     isempty(auth) && return nothing
@@ -477,6 +479,9 @@ struct AccessTokenRecord{C}
     confirmation_jkt::Union{String,Nothing}
 end
 
+Base.show(io::IO, x::AccessTokenRecord) = show_redacted(io, x,
+    (:scope, :issued_at, :expires_at, :client_id, :subject, :claims, :revoked, :confirmation_jkt))
+
 # Default: the claims persist as they were issued, an open `Dict{String,Any}`.
 AccessTokenRecord(token, scope, issued_at, expires_at, client_id, subject, claims::Dict{String,Any}, revoked, confirmation_jkt) =
     AccessTokenRecord{Dict{String,Any}}(token, scope, issued_at, expires_at, client_id, subject, claims, revoked, confirmation_jkt)
@@ -595,6 +600,9 @@ struct IssuedAccessToken
     subject::Union{String,Nothing}
     confirmation_jkt::Union{String,Nothing}
 end
+
+Base.show(io::IO, x::IssuedAccessToken) = show_redacted(io, x,
+    (:claims, :scope, :issued_at, :expires_at, :client_id, :subject, :confirmation_jkt))
 
 function token_audience(issuer::JWTAccessTokenIssuer, audience)
     aud = audience === nothing ? issuer.audience : normalize_string_vector(audience)
@@ -879,6 +887,10 @@ struct AuthorizationCodeRecord
     extra_claims::Dict{String,Any}
 end
 
+Base.show(io::IO, x::AuthorizationCodeRecord) = show_redacted(io, x,
+    (:client_id, :redirect_uri, :scope, :subject, :code_challenge, :code_challenge_method, :issued_at, :expires_at,
+     :authorization_details, :resource, :extra_claims))
+
 """
     AuthorizationCodeStore
 
@@ -1001,6 +1013,10 @@ struct AuthorizationEndpointConfig{S<:AuthorizationCodeStore,R<:Function,C<:Func
     allowed_code_challenge_methods::Set{String}
 end
 
+# the resolver and consent handler are closures, which print the values they capture
+Base.show(io::IO, x::AuthorizationEndpointConfig) = show_redacted(io, x,
+    (:code_store, :code_ttl, :require_pkce, :allowed_code_challenge_methods))
+
 """
     AuthorizationEndpointConfig(; code_store, redirect_uri_resolver, consent_handler, code_ttl_seconds=600, require_pkce=true, allowed_code_challenge_methods=["S256"])
 
@@ -1059,6 +1075,9 @@ struct RefreshTokenGrantRecord
     issued_at::DateTime
     expires_at::Union{DateTime,Nothing}
 end
+
+Base.show(io::IO, x::RefreshTokenGrantRecord) = show_redacted(io, x,
+    (:client_id, :subject, :scope, :resource, :authorization_details, :extra_claims, :issued_at, :expires_at))
 
 """
     RefreshTokenGrantStore
@@ -1311,6 +1330,8 @@ struct IssuedTokenPair
     refresh_token::String
     refresh_grant::RefreshTokenGrantRecord
 end
+
+Base.show(io::IO, x::IssuedTokenPair) = show_redacted(io, x, (:access_token, :refresh_grant))
 
 function issue_access_token(
     service::TokenService;
@@ -1630,6 +1651,11 @@ struct TokenEndpointConfig{S<:AuthorizationCodeStore,I<:JWTAccessTokenIssuer,C<:
     refresh_token_ttl::Union{Dates.Second,Nothing}
     token_service::Union{TokenService,Nothing}
 end
+
+# the callbacks are closures, which print the values they capture: the authenticator from
+# `client_credentials_authenticator` captures every client secret
+Base.show(io::IO, x::TokenEndpointConfig) = show_redacted(io, x,
+    (:code_store, :token_issuer, :token_store, :allowed_grant_types, :refresh_grant_store, :refresh_token_ttl, :token_service))
 
 """
     TokenEndpointConfig(; code_store, token_issuer, client_authenticator,
@@ -2323,6 +2349,8 @@ struct BasicCredentialsAuthenticator <: EndpointAuthenticator
     credentials::Dict{String,String}
 end
 
+Base.show(io::IO, x::BasicCredentialsAuthenticator) = show_redacted(io, x, (:realm,))
+
 """
     BasicCredentialsAuthenticator(; credentials, realm=\"oauth2\")
 
@@ -2431,6 +2459,9 @@ struct AccessTokenClaims
     claims::Dict{String,Any}
     confirmation_jkt::Union{String,Nothing}
 end
+
+Base.show(io::IO, x::AccessTokenClaims) = show_redacted(io, x,
+    (:subject, :client_id, :scope, :audience, :expires_at, :issued_at, :claims, :confirmation_jkt))
 
 function AccessTokenClaims(; token, subject, client_id, scope, audience, expires_at, issued_at, claims, confirmation_jkt=nothing)
     return AccessTokenClaims(

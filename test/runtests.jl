@@ -3305,3 +3305,57 @@ include("trim_compile_tests.jl")
     @async (sleep(0.2); put!(delivered, params))
     @test OAuth.take_with_timeout(delivered, 5) == params
 end
+
+@testset "show never prints tokens, secrets, or credentials" begin
+    secret = "SECRETvalue-" * repeat("x", 40) # also a valid PKCE verifier
+    now_ = Dates.now(UTC)
+    store = OAuth.InMemoryRefreshTokenStore()
+    public = OAuth.PublicClientConfig(client_id="c", redirect_uri="https://app.example/cb", refresh_token_store=store)
+    OAuth.save_refresh_token!(public, secret)
+    held = Ref(secret)
+    token = OAuth.TokenResponse(JSON.parse(JSON.json(Dict("access_token" => secret, "token_type" => "Bearer",
+        "refresh_token" => secret, "id_token" => secret, "provider_token" => secret))))
+    device = OAuth.DeviceAuthorizationResponse(JSON.parse(JSON.json(Dict("device_code" => secret,
+        "user_code" => "WDJB-MJHT", "verification_uri" => "https://id.example/device", "expires_in" => 600))))
+    metadata = OAuth.AuthorizationServerMetadata(JSON.parse(JSON.json(Dict("issuer" => "https://id.example",
+        "authorization_endpoint" => "https://id.example/authorize", "token_endpoint" => "https://id.example/token"))))
+    issuer = OAuth.JWTAccessTokenIssuer(issuer="https://id.example", audience=["https://api.example"],
+        private_key=fixture_string("rsa_private.pem"))
+    issued = OAuth.IssuedAccessToken(secret, Dict{String,Any}(), ["read"], now_, now_, "c", "user", nothing)
+    grant = OAuth.RefreshTokenGrantRecord(secret, "c", "user", ["read"], String[], nothing, Dict{String,Any}(), now_, nothing)
+    objects = Any[
+        store, public, token, device, issued, grant,
+        OAuth.CallbackRefreshTokenStore(load = _ -> held[], save = (_, t) -> (held[] = t)),
+        OAuth.AuthorizationSession(authorization_url="https://id.example/authorize", redirect_uri="https://app.example/cb",
+            verifier=OAuth.PKCEVerifier(secret), state="state", authorization_server=metadata, resource=nothing,
+            client_config=public, listener=nothing),
+        OAuth.set!(OAuth.FormParams(), "refresh_token", secret),
+        OAuth.ConfidentialClientConfig(client_id="c", client_secret=secret),
+        OAuth.ConfidentialClientConfig(client_id="c", credential=OAuth.ClientSecretJWTAuth(secret)),
+        OAuth.ConfidentialClientConfig(client_id="c", credential=OAuth.TLSClientAuth((private_key=secret,))),
+        OAuth.AuthorizationCredentials("Bearer", secret),
+        OAuth.IssuedTokenPair(issued, secret, grant),
+        OAuth.AccessTokenRecord{Dict{String,Any}}(secret, ["read"], now_, now_, "c", "user", Dict{String,Any}(), false, nothing),
+        OAuth.AuthorizationCodeRecord(secret, "c", "https://app.example/cb", ["read"], "user", nothing, nothing,
+            now_, now_, nothing, String[], Dict{String,Any}()),
+        OAuth.AccessTokenClaims(secret, "user", "c", ["read"], ["https://api.example"], now_, now_, Dict{String,Any}(), nothing),
+        OAuth.BasicCredentialsAuthenticator(credentials=Dict("c" => secret)),
+        # closures print the values they capture
+        OAuth.TokenEndpointConfig(code_store=OAuth.InMemoryAuthorizationCodeStore(), token_issuer=issuer,
+            client_authenticator=OAuth.client_credentials_authenticator(Dict("c" => secret))),
+        OAuth.AuthorizationEndpointConfig(code_store=OAuth.InMemoryAuthorizationCodeStore(),
+            redirect_uri_resolver=(_req, _client, uri) -> uri, consent_handler=(_req, _ctx) -> OAuth.grant_authorization(secret)),
+    ]
+    secret_bytes = join(repr.(codeunits("SECRET")), ", ") # how the secret prints inside a Vector{UInt8}
+    leaks(shown) = occursin("SECRET", shown) || occursin(secret_bytes, shown)
+    for x in objects
+        @test !leaks(repr(x))
+        @test !leaks(sprint(show, MIME"text/plain"(), x))
+        @test occursin("<redacted>", repr(x))
+    end
+    # fields that are safe to read still print
+    @test occursin("token_type=\"Bearer\"", repr(token))
+    @test occursin("user_code=\"WDJB-MJHT\"", repr(device))
+    @test occursin("method=:client_secret_basic", repr(OAuth.ClientSecretAuth(secret)))
+    @test occursin("refresh_token=nothing", repr(OAuth.TokenResponse(JSON.parse("""{"access_token":"a","token_type":"Bearer"}"""))))
+end
