@@ -23,6 +23,30 @@ end
 
 FormParams() = FormParams(Dict{String,String}(), Pair{String,String}[])
 
+# `show` for types that hold tokens, secrets, or other credentials. Prints
+# `T(field=value, ...)` with the values of the `public` fields; every other field prints
+# as `<redacted>` (or `nothing` when unset), so printed objects in the REPL, logs, and
+# error reports never contain a credential. A field added later stays hidden until it is
+# listed as public.
+function show_redacted(io::IO, x, public::Tuple{Vararg{Symbol}}=())
+    show(io, Base.typename(typeof(x)).wrapper)
+    print(io, '(')
+    for (i, name) in enumerate(fieldnames(typeof(x)))
+        i > 1 && print(io, ", ")
+        print(io, name, '=')
+        value = getfield(x, name)
+        if name in public || value === nothing
+            show(io, value)
+        else
+            print(io, "<redacted>")
+        end
+    end
+    print(io, ')')
+end
+
+# form fields of token requests: refresh tokens, codes, verifiers, client secrets
+Base.show(io::IO, x::FormParams) = show_redacted(io, x)
+
 function set!(form::FormParams, key, value)
     form.unique[String(key)] = String(value)
     return form

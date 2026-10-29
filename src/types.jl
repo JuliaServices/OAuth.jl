@@ -53,6 +53,8 @@ struct InMemoryRefreshTokenStore <: RefreshTokenStore
     flight::RefreshFlight
 end
 
+Base.show(io::IO, x::InMemoryRefreshTokenStore) = show_redacted(io, x, (:flight,))
+
 InMemoryRefreshTokenStore(token) = InMemoryRefreshTokenStore(token, RefreshFlight())
 InMemoryRefreshTokenStore() = InMemoryRefreshTokenStore(Base.RefValue{Union{Nothing,String}}(nothing))
 
@@ -217,6 +219,9 @@ struct CallbackRefreshTokenStore{L,S,C} <: RefreshTokenStore
     clear_callback::C
     flight::RefreshFlight
 end
+
+# the callbacks are closures, and closures print the values they capture (often the token)
+Base.show(io::IO, x::CallbackRefreshTokenStore) = show_redacted(io, x, (:flight,))
 
 CallbackRefreshTokenStore(load::L, save::S, clear::C) where {L,S,C} =
     CallbackRefreshTokenStore{L,S,C}(load, save, clear, RefreshFlight())
@@ -419,6 +424,8 @@ struct ClientSecretAuth <: TokenEndpointAuth
     secret::String
 end
 
+Base.show(io::IO, x::ClientSecretAuth) = show_redacted(io, x, (:method,))
+
 """
     ClientSecretJWTAuth(secret::Vector{UInt8}, alg::Symbol, expires_in::Int, clock_skew::Int, extra_claims::Dict)
 
@@ -434,6 +441,8 @@ struct ClientSecretJWTAuth <: TokenEndpointAuth
     clock_skew::Int
     extra_claims::Dict{String,Any}
 end
+
+Base.show(io::IO, x::ClientSecretJWTAuth) = show_redacted(io, x, (:alg, :expires_in, :clock_skew, :extra_claims))
 
 """
     PrivateKeyJWTAuth(signer::JWTSigner, alg::Symbol, kid, audience, expires_in, clock_skew, extra_claims)
@@ -463,6 +472,9 @@ struct TLSClientAuth{C} <: TokenEndpointAuth
     method::Symbol
     sslconfig::C
 end
+
+# `sslconfig` holds the client's private key
+Base.show(io::IO, x::TLSClientAuth) = show_redacted(io, x, (:method,))
 
 """
     TLSClientAuth(sslconfig; method=:tls_client_auth)
@@ -979,6 +991,8 @@ struct PKCEVerifier
     verifier::String
 end
 
+Base.show(io::IO, x::PKCEVerifier) = show_redacted(io, x)
+
 """
     TokenResponse
 
@@ -1001,6 +1015,10 @@ Base.@kwdef struct TokenResponse
     extra::Dict{String,Any}
     raw::JSONObject
 end
+
+# `raw` is the whole response document; `extra` holds fields OAuth.jl doesn't model, which can be tokens too
+Base.show(io::IO, x::TokenResponse) = show_redacted(io, x,
+    (:token_type, :expires_at, :scope, :dpop_jkt, :dpop_nonce, :authorization_details, :resource, :issued_token_type))
 
 function token_file_contents(token::TokenResponse)
     payload = Dict(
@@ -1110,6 +1128,10 @@ Base.@kwdef struct DeviceAuthorizationResponse
     interval::Dates.Second
     raw::JSONObject
 end
+
+# `raw` repeats the device_code
+Base.show(io::IO, x::DeviceAuthorizationResponse) = show_redacted(io, x,
+    (:user_code, :verification_uri, :verification_uri_complete, :expires_at, :interval))
 
 const TOKEN_RESPONSE_KNOWN_KEYS = Set([
     "access_token",
