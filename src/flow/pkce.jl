@@ -325,7 +325,11 @@ Refreshes an access token using the stored refresh token.  `source` can be:
 3. Named tuple returned by `complete_pkce_authorization` — we reuse the session metadata.
 
 When `refresh_token` is omitted we fall back to whatever the configured
-`RefreshTokenStore` persisted earlier.
+`RefreshTokenStore` persisted earlier.  Concurrent calls that use the stored
+token through one of the built-in stores make one token request: a call that
+waited while a refresh with the same parameters ran returns that refresh's
+token, or throws its error.  On `invalid_grant` the store is cleared only if it
+still holds the rejected token.
 """
 function refresh_pkce_token(
     metadata::AuthorizationServerMetadata,
@@ -340,11 +344,46 @@ function refresh_pkce_token(
     verbose = effective_verbose(config, verbose)
     metadata.token_endpoint === nothing && throw(OAuthError(:metadata_error, "Token endpoint missing in issuer metadata"))
     ensure_https_url(String(metadata.token_endpoint), "token_endpoint")
-    token_value = refresh_token === nothing ? load_refresh_token(config) : String(refresh_token)
-    token_value === nothing && throw(OAuthError(:configuration_error, "refresh_token is not available"))
+    form = refresh_token_form(config, extra_token_params)
+    redeem() = redeem_refresh_token(metadata, config, form,
+        refresh_token === nothing ? load_refresh_token(config) : String(refresh_token);
+        http, verbose, _persist_result, _clear_invalid_grant)
+    flight = refresh_token === nothing ? refresh_flight(config.refresh_token_store) : nothing
+    flight === nothing && return redeem()
+    # refreshes are interchangeable when they hit the same endpoint with the same fields and DPoP key
+    request = string(metadata.token_endpoint, '\n', encode_form(form), '\n', config.dpop === nothing ? "" : config.dpop.thumbprint)
+    return single_flight_refresh(redeem, flight, request)
+end
+
+# Runs `redeem` under the store's flight lock, unless a refresh with the same request
+# finished while this caller waited: then that refresh's outcome is returned instead.
+function single_flight_refresh(redeem, flight::RefreshFlight, request::String)
+    seen = @atomic flight.finished
+    return lock(flight.lock) do
+        if (@atomic flight.finished) != seen && flight.request == request
+            flight.failed && throw(flight.outcome)
+            return flight.outcome::TokenResponse
+        end
+        failed = false
+        try
+            flight.outcome = redeem()
+        catch err
+            failed = true
+            flight.outcome = err
+            rethrow()
+        finally
+            flight.request = request
+            flight.failed = failed
+            @atomic flight.finished += 1
+        end
+        return flight.outcome::TokenResponse
+    end
+end
+
+# The refresh request's form fields, except the refresh token itself.
+function refresh_token_form(config::PublicClientConfig, extra_token_params)
     form = FormParams()
     set!(form, "grant_type", "refresh_token")
-    set!(form, "refresh_token", token_value)
     set!(form, "client_id", config.client_id)
     token_extra = normalize_string_params(extra_token_params)
     auth_override, resource_override = extract_special_authorize_params!(token_extra)
@@ -360,6 +399,24 @@ function refresh_pkce_token(
             push!(form, "resource", resource)
         end
     end
+    return form
+end
+
+function redeem_refresh_token(
+    metadata::AuthorizationServerMetadata,
+    config::PublicClientConfig,
+    form::FormParams,
+    token_value::Union{String,Nothing};
+    http,
+    verbose::Bool,
+    _persist_result::Bool,
+    _clear_invalid_grant::Bool,
+)
+    token_value === nothing && throw(OAuthError(:configuration_error, "refresh_token is not available"))
+    form = FormParams(copy(form.unique), copy(form.repeated))
+    # a `refresh_token` given in extra_token_params overrides the stored one
+    haskey(form.unique, "refresh_token") || set!(form, "refresh_token", token_value)
+    sent_token = form.unique["refresh_token"]
     body = encode_form(form)
     headers_pairs = [
         "Content-Type" => "application/x-www-form-urlencoded",
@@ -378,7 +435,7 @@ function refresh_pkce_token(
             if err isa AbstractDict
                 err_code = get(err, "error", nothing)
                 if err_code isa AbstractString && lowercase(String(err_code)) == "invalid_grant"
-                    _clear_invalid_grant && clear_refresh_token!(config)
+                    _clear_invalid_grant && clear_rejected_refresh_token!(config, sent_token)
                     description = get(err, "error_description", "invalid_grant")
                     message = description isa AbstractString ? String(description) : "invalid_grant"
                     throw(OAuthError(:invalid_grant, "Refresh token rejected: $(message)"))
